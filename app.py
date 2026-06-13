@@ -16,8 +16,10 @@ Na primeira execução, faça login manualmente na janela do Chrome que abrir.
 from __future__ import annotations
 
 import json
+import re
 import time
 import traceback
+from typing import List, Optional, Tuple
 
 from flask import Flask, Response, jsonify, request
 
@@ -26,6 +28,127 @@ import proxy
 
 
 app = Flask(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Tool Call Parsing
+# ---------------------------------------------------------------------------
+# O DeepSeek web não tem suporte nativo a tool calls — quando o modelo
+# decide usar uma ferramenta, ele emite algo como:
+#   
+#     {"name": "get_weather", "arguments": {...}}
+#   
+# ou
+#   ```json
+#   {"name": "get_weather", "arguments": {...}}
+#   ```
+# Este parser detecta esses padrões e converte pro formato OpenAI nativo:
+#   message.tool_calls = [{id, type, function: {name, arguments}}]
+#   finish_reason = "tool_calls"
+
+_TC_PATTERNS = [
+    # Hermes-style
+    re.compile(
+        r'\s*\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"(?:arguments|parameters)"\s*:\s*(?:\{[^{}]*\}|"[^"]*")\s*\}\s*',
+        re.DOTALL,
+    ),
+    # JSON code-fence block
+    re.compile(
+        r'```(?:json)?\s*\n?\s*\{\s*"name"\s*:\s*"[^"]+"\s*,\s*"(?:arguments|parameters)"\s*:\s*(?:\{.*?\}|".*?")\s*\}\s*\n?```',
+        re.DOTALL,
+    ),
+]
+
+
+def _try_parse_tool_json(bloco: str) -> Optional[dict]:
+    """Tenta extrair um JSON de tool call de um bloco de texto."""
+    # Remove fences de código
+    bloco = re.sub(r'^```(?:json)?\s*\n?', '', bloco.strip())
+    bloco = re.sub(r'\n?```\s*$', '', bloco.strip())
+    # Remove tags XML
+    bloco = re.sub(r'^[^{]*', '', bloco)
+    bloco = re.sub(r'[^}]*$', '', bloco)
+    try:
+        obj = json.loads(bloco)
+    except Exception:
+        return None
+    if not isinstance(obj, dict):
+        return None
+    name = obj.get("name") or obj.get("function")
+    if not name:
+        return None
+    args = obj.get("arguments") or obj.get("parameters") or {}
+    if isinstance(args, dict):
+        args = json.dumps(args, ensure_ascii=False)
+    return {"name": str(name), "arguments": str(args)}
+
+
+def _extract_tool_calls(texto: str) -> Tuple[str, List[dict]]:
+    """
+    Varre o texto procurando tool calls. Retorna:
+      (texto_sem_tool_calls, lista_de_tool_calls_no_formato_OpenAI)
+    """
+    if not texto or '{"name"' not in texto:
+        return texto or "", []
+
+    tool_calls = []
+    texto_limpo = texto
+    id_counter = 0
+
+    for pattern in _TC_PATTERNS:
+        novo_texto = texto_limpo
+        for m in reversed(list(pattern.finditer(novo_texto))):
+            bloco = m.group(0)
+            parsed = _try_parse_tool_json(bloco)
+            if parsed:
+                id_counter += 1
+                tool_calls.insert(0, {
+                    "id": f"call_{int(time.time())}_{id_counter:03d}",
+                    "type": "function",
+                    "function": {
+                        "name": parsed["name"],
+                        "arguments": parsed["arguments"],
+                    },
+                })
+                # Remove o bloco do texto visível
+                novo_texto = novo_texto[:m.start()] + novo_texto[m.end():]
+        texto_limpo = novo_texto
+
+    texto_limpo = re.sub(r'\n{3,}', '\n\n', texto_limpo).strip()
+    return texto_limpo, tool_calls
+
+
+def _build_completion_payload(
+    texto: str,
+    model: str,
+    tool_calls: Optional[List[dict]] = None,
+) -> dict:
+    agora = int(time.time())
+    finish_reason = "tool_calls" if tool_calls else "stop"
+    message = {"role": "assistant"}
+    if tool_calls:
+        message["content"] = texto if texto else None
+        message["tool_calls"] = tool_calls
+    else:
+        message["content"] = texto
+    return {
+        "id": f"chatcmpl-{agora}",
+        "object": "chat.completion",
+        "created": agora,
+        "model": model,
+        "choices": [
+            {
+                "index": 0,
+                "message": message,
+                "finish_reason": finish_reason,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": 0,
+            "completion_tokens": 0,
+            "total_tokens": 0,
+        },
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -61,33 +184,7 @@ def _extract_last_user_prompt(messages: list) -> str:
     return "\n".join(linhas).strip()
 
 
-def _build_completion_payload(
-    texto: str,
-    model: str,
-    finish_reason: str = "stop",
-) -> dict:
-    agora = int(time.time())
-    return {
-        "id": f"chatcmpl-{agora}",
-        "object": "chat.completion",
-        "created": agora,
-        "model": model,
-        "choices": [
-            {
-                "index": 0,
-                "message": {
-                    "role": "assistant",
-                    "content": texto,
-                },
-                "finish_reason": finish_reason,
-            }
-        ],
-        "usage": {
-            "prompt_tokens": 0,
-            "completion_tokens": 0,
-            "total_tokens": 0,
-        },
-    }
+
 
 
 # ---------------------------------------------------------------------------
@@ -166,8 +263,10 @@ def chat_completions():
                 }) + "\n\n"
             )
 
+            texto_acumulado = ""
             try:
                 for delta in proxy.stream_prompt(prompt, timeout=timeout):
+                    texto_acumulado += delta
                     yield (
                         "data: " + json.dumps({
                             "id": id_,
@@ -182,7 +281,6 @@ def chat_completions():
                         }) + "\n\n"
                     )
             except TimeoutError as e:
-                # Envia erro como chunk final (cliente OpenAI normalmente só fecha conexão)
                 yield (
                     "data: " + json.dumps({
                         "id": id_,
@@ -196,6 +294,8 @@ def chat_completions():
                         }],
                     }) + "\n\n"
                 )
+                yield "data: [DONE]\n\n"
+                return
             except Exception as e:
                 traceback.print_exc()
                 yield (
@@ -211,6 +311,35 @@ def chat_completions():
                         }],
                     }) + "\n\n"
                 )
+                yield "data: [DONE]\n\n"
+                return
+
+            # Verifica se há tool calls no texto acumulado
+            _, tool_calls = _extract_tool_calls(texto_acumulado)
+            finish = "tool_calls" if tool_calls else "stop"
+
+            # Se encontrou tool calls, emite chunk com a estrutura
+            if tool_calls:
+                yield (
+                    "data: " + json.dumps({
+                        "id": id_,
+                        "object": "chat.completion.chunk",
+                        "created": criado,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"tool_calls": [
+                                {
+                                    "index": i,
+                                    "id": tc["id"],
+                                    "type": tc["type"],
+                                    "function": tc["function"],
+                                } for i, tc in enumerate(tool_calls)
+                            ]},
+                            "finish_reason": None,
+                        }],
+                    }) + "\n\n"
+                )
 
             # Chunk final: finish
             yield (
@@ -222,7 +351,7 @@ def chat_completions():
                     "choices": [{
                         "index": 0,
                         "delta": {},
-                        "finish_reason": "stop",
+                        "finish_reason": finish,
                     }],
                 }) + "\n\n"
             )
@@ -244,7 +373,10 @@ def chat_completions():
             }
         }), 500
 
-    return jsonify(_build_completion_payload(texto, model))
+    # Extrai tool calls do texto gerado
+    texto_limpo, tool_calls = _extract_tool_calls(texto)
+
+    return jsonify(_build_completion_payload(texto_limpo, model, tool_calls=tool_calls))
 
 
 # ---------------------------------------------------------------------------
