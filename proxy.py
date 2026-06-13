@@ -204,28 +204,36 @@ return true;
 
 _JS_POLL_DELTAS = """
 // Retorna os deltas acumulados e limpa o buffer.
-// Também detecta se a geração terminou.
 const deltas = window.__deepseek_deltas || [];
 window.__deepseek_deltas = [];
 
-// Detecta fim da geração: botão "Stop" ausente E sem cursor piscando
-const stopBtn = document.querySelector(
-    'button[aria-label*="top" i], button[aria-label*="ancel" i], button[aria-label*="egenerate" i]'
-);
+// Detecção robusta de "gerando":
+// 1. Botão Stop visível
+const stopBtn = document.querySelector('button[aria-label*="top" i], button[aria-label*="ancel" i], button[aria-label*="Stop" i], [class*="stop"]');
 const stopVisible = stopBtn && stopBtn.offsetParent !== null;
-const cursor = document.querySelector('.cursor-blink, [class*="typing"]');
 
-// Conferimos se ainda existe uma mensagem do assistente na tela
-const msgs = document.querySelectorAll('.ds-markdown.ds-assistant-message-main-content');
+// 2. Textarea desabilitado/readonly (sinal clássico de gerando)
+const textarea = document.querySelector('textarea');
+const isTextareaDisabled = textarea && (textarea.disabled || textarea.readOnly);
+
+// 3. Cursor piscando ou indicador de thinking
+const cursor = document.querySelector('.cursor-blink, [class*="typing"], [class*="thinking"]');
+const hasCursor = !!cursor;
+
+const msgs = document.querySelectorAll('.ds-markdown.ds-assistant-message-main-content, [class*="message-content"]');
 const hasAssistant = msgs.length > 0;
 
-// done = temos pelo menos 1 mensagem de assistente E nada está gerando
-const done = hasAssistant && !stopVisible && !cursor;
+// "Gerando" se: stop visível, OU textarea desabilitado, OU cursor presente
+const isGenerating = stopVisible || isTextareaDisabled || hasCursor;
+
+// done apenas se tem mensagem e NÃO está gerando
+const done = hasAssistant && !isGenerating;
 
 return {
     deltas: deltas,
     done: done,
-    total_len: (window.__deepseek_last_text || '').length
+    total_len: (window.__deepseek_last_text || '').length,
+    is_generating: isGenerating
 };
 """
 
@@ -319,6 +327,8 @@ def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterato
         primeira_resposta_vista = False
         sem_deltas_ha = 0.0
         ultimo_poll = time.time()
+        stable_done_count = 0
+        STABLE_POLLS_NEEDED = 4  # ~800ms de estabilidade sem deltas pra considerar concluído
 
         try:
             while time.time() < deadline:
@@ -329,23 +339,28 @@ def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterato
                 if deltas:
                     primeira_resposta_vista = True
                     sem_deltas_ha = 0.0
+                    stable_done_count = 0  # reset se chegar delta novo
                     for delta in deltas:
                         yield delta
                 else:
                     sem_deltas_ha += (time.time() - ultimo_poll)
+                    if done:
+                        stable_done_count += 1
+                    else:
+                        stable_done_count = 0
 
                 ultimo_poll = time.time()
 
                 # Timeout de "nunca começou a responder"
-                if not primeira_resposta_vista and sem_deltas_ha > 30:
+                if not primeira_resposta_vista and sem_deltas_ha > 45:
                     raise TimeoutError(
-                        f"DeepSeek não começou a responder em 30s. "
+                        f"DeepSeek não começou a responder em 45s. "
                         "Verifique se o login ainda está ativo."
                     )
 
-                # Se terminou de gerar, faz um último poll pra pegar restos
-                if done and primeira_resposta_vista:
-                    # Pequeno grace period pra garantir que pegamos tudo
+                # Se terminou de gerar de forma ESTÁVEL (evita cortes em micro-pausas)
+                if done and primeira_resposta_vista and stable_done_count >= STABLE_POLLS_NEEDED:
+                    # Último flush pra garantir
                     time.sleep(0.3)
                     info_final = _poll_deltas(driver)
                     for delta in (info_final.get("deltas", []) or []):
