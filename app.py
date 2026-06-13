@@ -83,40 +83,86 @@ def _try_parse_tool_json(bloco: str) -> Optional[dict]:
     return {"name": str(name), "arguments": str(args)}
 
 
+def _parse_xml_tool_call(name: str, body: str) -> Optional[dict]:
+    """Extrai argumentos de sub-tags XML."""
+    args = {}
+    sub_re = re.compile(
+        r'<([a-zA-Z_][a-zA-Z0-9_]*)>(.*?)</\1>',
+        re.DOTALL,
+    )
+    for m in sub_re.finditer(body):
+        args[m.group(1)] = m.group(2).strip()
+    if not args:
+        bs = body.strip()
+        if bs.startswith("{"):
+            try:
+                args = json.loads(bs)
+            except Exception:
+                args = {"input": bs}
+        elif bs:
+            args = {"input": bs}
+    return {
+        "name": name,
+        "arguments": json.dumps(args, ensure_ascii=False) if isinstance(args, dict) else str(args),
+    }
+
+
 def _extract_tool_calls(texto: str) -> Tuple[str, List[dict]]:
     """
-    Varre o texto procurando tool calls. Retorna:
+    Varre o texto procurando tool calls (JSON ou XML). Retorna:
       (texto_sem_tool_calls, lista_de_tool_calls_no_formato_OpenAI)
     """
-    if not texto or '{"name"' not in texto:
-        return texto or "", []
+    if not texto:
+        return "", []
 
     tool_calls = []
     texto_limpo = texto
     id_counter = 0
 
-    for pattern in _TC_PATTERNS:
-        novo_texto = texto_limpo
-        for m in reversed(list(pattern.finditer(novo_texto))):
-            bloco = m.group(0)
-            parsed = _try_parse_tool_json(bloco)
-            if parsed:
-                id_counter += 1
-                tool_calls.insert(0, {
-                    "id": f"call_{int(time.time())}_{id_counter:03d}",
-                    "type": "function",
-                    "function": {
-                        "name": parsed["name"],
-                        "arguments": parsed["arguments"],
-                    },
-                })
-                # Remove o bloco do texto visível
-                novo_texto = novo_texto[:m.start()] + novo_texto[m.end():]
-        texto_limpo = novo_texto
+    # 1. XML-style tool calls
+    xml_pat = (
+        re.escape('<tool_call') +
+        r'\\s+name\\s*=\\s*[' + chr(34) + chr(39) + r']([^' + chr(34) + chr(39) + r']+)[' + chr(34) + chr(39) + r']' + r'\\s*' +
+        re.escape('>') +
+        r'(.*?)' +
+        re.escape('</tool_call>')
+    )
+    xml_re = re.compile(xml_pat, re.DOTALL)
+    novo = texto_limpo
+    for m in reversed(list(xml_re.finditer(novo))):
+        parsed = _parse_xml_tool_call(m.group(1), m.group(2))
+        if parsed:
+            id_counter += 1
+            tool_calls.insert(0, {
+                "id": f"call_{int(time.time())}_{id_counter:03d}",
+                "type": "function",
+                "function": {"name": parsed["name"], "arguments": parsed["arguments"]},
+            })
+            novo = novo[:m.start()] + novo[m.end():]
+    texto_limpo = novo
+
+    # Remove wrapper tags se sobraram
+    texto_limpo = texto_limpo.replace('<tool_calls>', "")
+    texto_limpo = texto_limpo.replace('</tool_calls>', "")
+
+    # 2. JSON-style (logica original)
+    if '"name"' in texto_limpo:
+        for pattern in _TC_PATTERNS:
+            novo = texto_limpo
+            for m in reversed(list(pattern.finditer(novo))):
+                parsed = _try_parse_tool_json(m.group(0))
+                if parsed:
+                    id_counter += 1
+                    tool_calls.insert(0, {
+                        "id": f"call_{int(time.time())}_{id_counter:03d}",
+                        "type": "function",
+                        "function": {"name": parsed["name"], "arguments": parsed["arguments"]},
+                    })
+                    novo = novo[:m.start()] + novo[m.end():]
+            texto_limpo = novo
 
     texto_limpo = re.sub(r'\n{3,}', '\n\n', texto_limpo).strip()
     return texto_limpo, tool_calls
-
 
 def _build_completion_payload(
     texto: str,
