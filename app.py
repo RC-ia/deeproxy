@@ -122,7 +122,7 @@ def _extract_tool_calls(texto: str) -> Tuple[str, List[dict]]:
     # 1. XML-style tool calls
     xml_pat = (
         re.escape('<tool_call') +
-        r'\\s+name\\s*=\\s*[' + chr(34) + chr(39) + r']([^' + chr(34) + chr(39) + r']+)[' + chr(34) + chr(39) + r']' + r'\\s*' +
+        r'\s+name\s*=\s*[' + chr(34) + chr(39) + r']([^' + chr(34) + chr(39) + r']+)[' + chr(34) + chr(39) + r']' + r'\s*' +
         re.escape('>') +
         r'(.*?)' +
         re.escape('</tool_call>')
