@@ -1,15 +1,14 @@
 """
 proxy.py — núcleo do DeepProxy.
 
-Abre o DeepSeek Chat via Selenium, envia um prompt, aguarda a resposta
-completa e a devolve como string. Mantém o browser aberto entre chamadas
-para aproveitar o login persistente.
+Abre o DeepSeek Chat via Selenium, envia um prompt e captura a resposta.
+Suporta dois modos:
+  - send_prompt(prompt)        -> retorna a resposta completa (str)
+  - stream_prompt(prompt)      -> generator que yield deltas em tempo real
 
-Estratégia de captura:
-  1. Localiza o textarea de entrada e injeta o prompt.
-  2. Submete o formulário (Enter no textarea ou clique no botão Send).
-  3. Aguarda o indicador de "digitando"/loading desaparecer.
-  4. Lê o último bloco de mensagem do assistente.
+A captura incremental usa um MutationObserver injetado via JS que guarda
+os fragmentos novos numa variável window.__deepseek_deltas. O Python faz
+polling dessa variável a cada ~200ms e repassa os deltas ao cliente.
 """
 from __future__ import annotations
 
@@ -17,7 +16,7 @@ import os
 import re
 import threading
 import time
-from typing import Optional
+from typing import Iterator, Optional
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -46,14 +45,12 @@ def _build_options() -> Options:
     opts = Options()
     opts.add_argument(f"--user-data-dir={os.path.abspath(config.CHROME_PROFILE_DIR)}")
     opts.add_argument("--window-size=1100,900")
-    # Evita banners de "Chrome está sendo controlado por automação"
     opts.add_experimental_option("excludeSwitches", ["enable-automation"])
     opts.add_experimental_option("useAutomationExtension", False)
     return opts
 
 
 def get_driver() -> webdriver.Chrome:
-    """Retorna o driver singleton, criando-o se necessário."""
     global _driver
     with _browser_lock:
         if _driver is None:
@@ -66,7 +63,6 @@ def get_driver() -> webdriver.Chrome:
 
 
 def shutdown() -> None:
-    """Encerra o browser (chamado no shutdown do Flask)."""
     global _driver
     with _browser_lock:
         if _driver is not None:
@@ -78,7 +74,6 @@ def shutdown() -> None:
 
 
 def _click_search_button(driver: webdriver.Chrome) -> None:
-    """Clica no botão 'Search' do DeepSeek se estiver visível (não-crítico)."""
     js = """
     const botoes = document.querySelectorAll('._58b31c9 .ds-atom-button');
     const btn = Array.from(botoes).find(b => b.textContent.trim().toLowerCase() === 'search');
@@ -92,11 +87,10 @@ def _click_search_button(driver: webdriver.Chrome) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Envio + captura
+# Input helpers
 # ---------------------------------------------------------------------------
 
-def _find_textarea(driver: webdriver.Chrome) -> "WebElement":
-    """Localiza o campo de input do DeepSeek. Usa vários seletores conhecidos."""
+def _find_textarea(driver: webdriver.Chrome):
     candidatos = [
         (By.CSS_SELECTOR, "textarea#chat-input"),
         (By.CSS_SELECTOR, "textarea[placeholder]"),
@@ -114,12 +108,9 @@ def _find_textarea(driver: webdriver.Chrome) -> "WebElement":
 
 
 def _inject_prompt(driver: webdriver.Chrome, prompt: str) -> None:
-    """Injeta o texto no textarea via JS (mais confiável que send_keys para textos grandes)."""
     textarea = _find_textarea(driver)
-    # Foca no elemento
     textarea.click()
     time.sleep(0.2)
-    # Limpa e injeta via JS para preservar quebras de linha
     driver.execute_script(
         """
         const el = arguments[0];
@@ -140,8 +131,6 @@ def _inject_prompt(driver: webdriver.Chrome, prompt: str) -> None:
 
 
 def _submit_prompt(driver: webdriver.Chrome) -> None:
-    """Submete o prompt: tenta botão Send, senão Enter no textarea."""
-    # Tenta clicar no botão de envio
     botoes_send = [
         (By.CSS_SELECTOR, "button[aria-label*='end' i]"),
         (By.CSS_SELECTOR, "button[aria-label*='ubmit' i]"),
@@ -155,7 +144,6 @@ def _submit_prompt(driver: webdriver.Chrome) -> None:
                 return
         except (NoSuchElementException, WebDriverException):
             continue
-    # Fallback: Enter
     try:
         textarea = _find_textarea(driver)
         textarea.send_keys(Keys.ENTER)
@@ -163,66 +151,132 @@ def _submit_prompt(driver: webdriver.Chrome) -> None:
         raise RuntimeError(f"Não foi possível submeter o prompt: {e}")
 
 
-def _count_assistant_messages(driver: webdriver.Chrome) -> int:
-    """Conta quantos blocos de resposta do assistente existem na tela."""
-    js = """
-    const nodes = document.querySelectorAll(
-        '.ds-markdown, [class*="markdown-body"], [class*="answer-content"], [class*="message-content"]'
-    );
-    return nodes.length;
-    """
+# ---------------------------------------------------------------------------
+# Observador de deltas (MutationObserver injetado)
+# ---------------------------------------------------------------------------
+
+_JS_INSTALL_OBSERVER = """
+// Reinicia estado
+window.__deepseek_deltas = [];
+window.__deepseek_last_text = '';
+window.__deepseek_done = false;
+
+// Para observer anterior se houver
+if (window.__deepseek_observer) {
+    try { window.__deepseek_observer.disconnect(); } catch(e) {}
+}
+
+const observer = new MutationObserver(() => {
+    // Pega a ÚLTIMA mensagem do assistente (a que está sendo gerada agora)
+    const msgs = document.querySelectorAll('.ds-markdown.ds-assistant-message-main-content');
+    if (!msgs.length) return;
+    const msg = msgs[msgs.length - 1];
+    const currentText = msg.innerText || '';
+    const last = window.__deepseek_last_text;
+
+    if (currentText !== last && currentText.length > last.length) {
+        // Só consideramos o delta se começar com o texto anterior
+        // (evita pegarmos lixo quando o DOM é re-renderizado do zero)
+        if (currentText.startsWith(last)) {
+            const delta = currentText.substring(last.length);
+            if (delta.length > 0) {
+                window.__deepseek_deltas.push(delta);
+            }
+        } else {
+            // Re-render: trata o texto inteiro como delta (primeira vez ou reset)
+            if (last === '' && currentText.length > 0) {
+                window.__deepseek_deltas.push(currentText);
+            }
+        }
+        window.__deepseek_last_text = currentText;
+    }
+});
+
+observer.observe(document.body, {
+    childList: true,
+    subtree: true,
+    characterData: true
+});
+
+window.__deepseek_observer = observer;
+return true;
+"""
+
+_JS_POLL_DELTAS = """
+// Retorna os deltas acumulados e limpa o buffer.
+// Também detecta se a geração terminou.
+const deltas = window.__deepseek_deltas || [];
+window.__deepseek_deltas = [];
+
+// Detecta fim da geração: botão "Stop" ausente E sem cursor piscando
+const stopBtn = document.querySelector(
+    'button[aria-label*="top" i], button[aria-label*="ancel" i], button[aria-label*="egenerate" i]'
+);
+const stopVisible = stopBtn && stopBtn.offsetParent !== null;
+const cursor = document.querySelector('.cursor-blink, [class*="typing"]');
+
+// Conferimos se ainda existe uma mensagem do assistente na tela
+const msgs = document.querySelectorAll('.ds-markdown.ds-assistant-message-main-content');
+const hasAssistant = msgs.length > 0;
+
+// done = temos pelo menos 1 mensagem de assistente E nada está gerando
+const done = hasAssistant && !stopVisible && !cursor;
+
+return {
+    deltas: deltas,
+    done: done,
+    total_len: (window.__deepseek_last_text || '').length
+};
+"""
+
+_JS_STOP_OBSERVER = """
+if (window.__deepseek_observer) {
+    try { window.__deepseek_observer.disconnect(); } catch(e) {}
+    window.__deepseek_observer = null;
+}
+const final_text = window.__deepseek_last_text || '';
+const remaining = window.__deepseek_deltas || [];
+window.__deepseek_deltas = [];
+return { final_text: final_text, remaining: remaining };
+"""
+
+
+def _install_observer(driver: webdriver.Chrome) -> None:
+    driver.execute_script(_JS_INSTALL_OBSERVER)
+
+
+def _poll_deltas(driver: webdriver.Chrome) -> dict:
     try:
-        return int(driver.execute_script(js) or 0)
+        result = driver.execute_script(_JS_POLL_DELTAS)
+        return result or {"deltas": [], "done": False, "total_len": 0}
     except Exception:
-        return 0
+        return {"deltas": [], "done": False, "total_len": 0}
 
 
-def _is_generating(driver: webdriver.Chrome) -> bool:
-    """Retorna True se o DeepSeek ainda estiver gerando a resposta."""
-    js = """
-    // Botão "Stop" visível = gerando
-    const stopBtn = document.querySelector(
-        'button[aria-label*="top" i], button[aria-label*="ancel" i]'
-    );
-    if (stopBtn && stopBtn.offsetParent !== null) return true;
-    // Cursor de digitação
-    const cursor = document.querySelector('.cursor-blink, [class*="typing"]');
-    if (cursor) return true;
-    return false;
-    """
+def _stop_observer(driver: webdriver.Chrome) -> dict:
     try:
-        return bool(driver.execute_script(js))
+        result = driver.execute_script(_JS_STOP_OBSERVER)
+        return result or {"final_text": "", "remaining": []}
     except Exception:
-        return False
+        return {"final_text": "", "remaining": []}
 
 
-def _extract_last_assistant_text(driver: webdriver.Chrome) -> str:
-    """Extrai o texto do último bloco de resposta do assistente."""
-    js = """
-    const nodes = document.querySelectorAll(
-        '.ds-markdown, [class*="markdown-body"], [class*="answer-content"], [class*="message-content"]'
-    );
-    if (!nodes.length) return '';
-    const last = nodes[nodes.length - 1];
-    return (last.innerText || last.textContent || '').trim();
+def _limpar_resposta(texto: str) -> str:
+    texto = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n", "", texto)
+    texto = re.sub(r"\n```\s*$", "", texto)
+    return texto.strip()
+
+
+# ---------------------------------------------------------------------------
+# API pública
+# ---------------------------------------------------------------------------
+
+def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterator[str]:
     """
-    try:
-        return driver.execute_script(js) or ""
-    except Exception:
-        return ""
+    Envia um prompt ao DeepSeek e yield deltas de texto em tempo real.
 
-
-def send_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> str:
-    """
-    Envia um prompt ao DeepSeek e retorna a resposta completa.
-
-    Fluxo:
-      1. Garante que estamos na URL do chat.
-      2. Conta quantas mensagens de assistente já existem.
-      3. Injeta + submete o novo prompt.
-      4. Aguarda aparecer uma NOVA mensagem de assistente.
-      5. Aguarda o indicador de geração sumir.
-      6. Extrai e retorna o texto da última mensagem.
+    Cada yield é um fragmento (string) novo que apareceu na resposta.
+    O generator termina quando o DeepSeek acaba de gerar.
     """
     driver = get_driver()
     prompt = (prompt or "").strip()
@@ -242,47 +296,69 @@ def send_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> str:
             driver.get(config.DEEPSEEK_URL)
             time.sleep(1)
 
-        mensagens_antes = _count_assistant_messages(driver)
+        # Instala o observer ANTES de submeter o prompt
+        _install_observer(driver)
 
-        # Injeta e submete
         _inject_prompt(driver, prompt)
         time.sleep(0.3)
         _submit_prompt(driver)
 
-        # Aguarda aparecer uma nova mensagem de assistente (ou começar a gerar)
         deadline = time.time() + timeout
-        while time.time() < deadline:
-            agora = _count_assistant_messages(driver)
-            if agora > mensagens_antes:
-                break
-            time.sleep(0.5)
-        else:
-            raise TimeoutError(
-                f"DeepSeek não começou a responder em {timeout}s. "
-                "Verifique se o login ainda está ativo."
-            )
+        primeira_resposta_vista = False
+        sem_deltas_ha = 0.0
+        ultimo_poll = time.time()
 
-        # Aguarda terminar de gerar
-        # Pequeno delay inicial pra evitar capturar o estado "antes de começar"
-        time.sleep(0.8)
-        while time.time() < deadline:
-            if not _is_generating(driver):
-                # Espera mais um pouco para garantir que o DOM foi atualizado
-                time.sleep(0.4)
-                if not _is_generating(driver):
-                    break
-            time.sleep(0.5)
+        try:
+            while time.time() < deadline:
+                info = _poll_deltas(driver)
+                deltas = info.get("deltas", []) or []
+                done = bool(info.get("done", False))
 
-        texto = _extract_last_assistant_text(driver)
-        if not texto:
-            raise RuntimeError("Resposta do DeepSeek veio vazia.")
+                if deltas:
+                    primeira_resposta_vista = True
+                    sem_deltas_ha = 0.0
+                    for delta in deltas:
+                        yield delta
+                else:
+                    sem_deltas_ha += (time.time() - ultimo_poll)
 
-        return _limpar_resposta(texto)
+                ultimo_poll = time.time()
+
+                # Timeout de "nunca começou a responder"
+                if not primeira_resposta_vista and sem_deltas_ha > 30:
+                    raise TimeoutError(
+                        f"DeepSeek não começou a responder em 30s. "
+                        "Verifique se o login ainda está ativo."
+                    )
+
+                # Se terminou de gerar, faz um último poll pra pegar restos
+                if done and primeira_resposta_vista:
+                    # Pequeno grace period pra garantir que pegamos tudo
+                    time.sleep(0.3)
+                    info_final = _poll_deltas(driver)
+                    for delta in (info_final.get("deltas", []) or []):
+                        yield delta
+                    return
+
+                time.sleep(0.2)
+
+            # Timeout total atingido: faz flush do que tiver
+            info_final = _poll_deltas(driver)
+            for delta in (info_final.get("deltas", []) or []):
+                yield delta
+
+        finally:
+            _stop_observer(driver)
 
 
-def _limpar_resposta(texto: str) -> str:
-    """Remove artefatos comuns (blocos de código fences triplos envolvendo tudo, etc.)."""
-    # Remove fence de abertura no início e de fechamento no fim, se envolverem TUDO
-    texto = re.sub(r"^```[a-zA-Z0-9_-]*\s*\n", "", texto)
-    texto = re.sub(r"\n```\s*$", "", texto)
-    return texto.strip()
+def send_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> str:
+    """
+    Modo não-streaming: concatena todos os deltas e retorna a resposta completa.
+    """
+    partes = []
+    for delta in stream_prompt(prompt, timeout=timeout):
+        partes.append(delta)
+    texto = "".join(partes)
+    if not texto:
+        raise RuntimeError("Resposta do DeepSeek veio vazia.")
+    return _limpar_resposta(texto)

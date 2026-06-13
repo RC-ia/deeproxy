@@ -4,7 +4,7 @@ requisições para o chat.deepseek.com via Selenium.
 
 Endpoints:
   GET  /v1/models             -> lista de modelos (apenas 1: deepseek-chat)
-  POST /v1/chat/completions   -> Chat Completions (com suporte a stream)
+  POST /v1/chat/completions   -> Chat Completions (com suporte a stream REAL)
   GET  /health                -> status do serviço
 
 Uso:
@@ -42,14 +42,12 @@ def _extract_last_user_prompt(messages: list) -> str:
     if not messages:
         raise ValueError("'messages' está vazio.")
 
-    # Caso simples: apenas 1 mensagem user
     users = [m for m in messages if m.get("role") == "user"]
     if len(messages) <= 2 and len(users) == 1 and not any(
         m.get("role") == "assistant" for m in messages
     ):
         return str(users[0].get("content", ""))
 
-    # Caso geral: monta prompt estruturado
     linhas = []
     for m in messages:
         role = m.get("role", "user")
@@ -138,10 +136,8 @@ def chat_completions():
             }
         }), 400
 
-    # Parâmetros opcionais
     model = data.get("model") or config.REPORTED_MODEL
     stream = bool(data.get("stream", False))
-    # timeout customizado via extra (não é parte do spec OpenAI, mas útil)
     timeout = int(data.get("timeout", config.DEFAULT_TIMEOUT))
 
     try:
@@ -149,6 +145,92 @@ def chat_completions():
     except ValueError as e:
         return jsonify({"error": {"message": str(e), "type": "invalid_request_error"}}), 400
 
+    # --- STREAMING REAL (deltas capturados via MutationObserver) ---
+    if stream:
+        id_ = f"chatcmpl-{int(time.time())}"
+        criado = int(time.time())
+
+        def gerar():
+            # Chunk 1: role
+            yield (
+                "data: " + json.dumps({
+                    "id": id_,
+                    "object": "chat.completion.chunk",
+                    "created": criado,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {"role": "assistant"},
+                        "finish_reason": None,
+                    }],
+                }) + "\n\n"
+            )
+
+            try:
+                for delta in proxy.stream_prompt(prompt, timeout=timeout):
+                    yield (
+                        "data: " + json.dumps({
+                            "id": id_,
+                            "object": "chat.completion.chunk",
+                            "created": criado,
+                            "model": model,
+                            "choices": [{
+                                "index": 0,
+                                "delta": {"content": delta},
+                                "finish_reason": None,
+                            }],
+                        }) + "\n\n"
+                    )
+            except TimeoutError as e:
+                # Envia erro como chunk final (cliente OpenAI normalmente só fecha conexão)
+                yield (
+                    "data: " + json.dumps({
+                        "id": id_,
+                        "object": "chat.completion.chunk",
+                        "created": criado,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"\n\n[ERRO: {e}]"},
+                            "finish_reason": "stop",
+                        }],
+                    }) + "\n\n"
+                )
+            except Exception as e:
+                traceback.print_exc()
+                yield (
+                    "data: " + json.dumps({
+                        "id": id_,
+                        "object": "chat.completion.chunk",
+                        "created": criado,
+                        "model": model,
+                        "choices": [{
+                            "index": 0,
+                            "delta": {"content": f"\n\n[ERRO: {e}]"},
+                            "finish_reason": "stop",
+                        }],
+                    }) + "\n\n"
+                )
+
+            # Chunk final: finish
+            yield (
+                "data: " + json.dumps({
+                    "id": id_,
+                    "object": "chat.completion.chunk",
+                    "created": criado,
+                    "model": model,
+                    "choices": [{
+                        "index": 0,
+                        "delta": {},
+                        "finish_reason": "stop",
+                    }],
+                }) + "\n\n"
+            )
+            yield "data: [DONE]\n\n"
+
+        return Response(gerar(), mimetype="text/event-stream")
+
+    # --- NÃO-STREAMING ---
     try:
         texto = proxy.send_prompt(prompt, timeout=timeout)
     except TimeoutError as e:
@@ -162,64 +244,7 @@ def chat_completions():
             }
         }), 500
 
-    if not stream:
-        return jsonify(_build_completion_payload(texto, model))
-
-    # --- Streaming SSE (word-by-word, compatível com clientes OpenAI) ---
-    def gerar():
-        id_ = f"chatcmpl-{int(time.time())}"
-        criado = int(time.time())
-
-        # Chunk 1: role
-        yield (
-            "data: " + json.dumps({
-                "id": id_,
-                "object": "chat.completion.chunk",
-                "created": criado,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {"role": "assistant"},
-                    "finish_reason": None,
-                }],
-            }) + "\n\n"
-        )
-
-        # Chunks de conteúdo (token-ish: por palavra)
-        palavras = texto.split(" ")
-        for i, palavra in enumerate(palavras):
-            delta_content = palavra if i == 0 else (" " + palavra)
-            yield (
-                "data: " + json.dumps({
-                    "id": id_,
-                    "object": "chat.completion.chunk",
-                    "created": criado,
-                    "model": model,
-                    "choices": [{
-                        "index": 0,
-                        "delta": {"content": delta_content},
-                        "finish_reason": None,
-                    }],
-                }) + "\n\n"
-            )
-
-        # Chunk final
-        yield (
-            "data: " + json.dumps({
-                "id": id_,
-                "object": "chat.completion.chunk",
-                "created": criado,
-                "model": model,
-                "choices": [{
-                    "index": 0,
-                    "delta": {},
-                    "finish_reason": "stop",
-                }],
-            }) + "\n\n"
-        )
-        yield "data: [DONE]\n\n"
-
-    return Response(gerar(), mimetype="text/event-stream")
+    return jsonify(_build_completion_payload(texto, model))
 
 
 # ---------------------------------------------------------------------------
@@ -227,10 +252,10 @@ def chat_completions():
 # ---------------------------------------------------------------------------
 
 def main():
-    # Inicializa o browser ao subir o servidor (pra já ficar pronto)
     print(f"[DeepProxy] 🟢 Subindo API em http://{config.API_HOST}:{config.API_PORT}")
     print(f"[DeepProxy]    Modelo reportado: {config.REPORTED_MODEL}")
     print(f"[DeepProxy]    Timeout padrão: {config.DEFAULT_TIMEOUT}s")
+    print(f"[DeepProxy]    Streaming: REAL (via MutationObserver)")
 
     try:
         proxy.get_driver()
