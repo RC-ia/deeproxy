@@ -15,7 +15,7 @@ DEEPSEEK_URL = "https://chat.deepseek.com"
 
 # Host/porta da API
 API_HOST = os.environ.get("DEEPROXY_HOST", "0.0.0.0")
-API_PORT = int(os.environ.get("DEEPROXY_PORT", "8000"))
+API_PORT = int(os.environ.get("DEEPROXY_PORT", "4000"))
 
 # Timeouts (segundos)
 DEFAULT_TIMEOUT = int(os.environ.get("DEEPROXY_TIMEOUT", "120"))

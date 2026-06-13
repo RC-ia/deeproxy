@@ -44,14 +44,14 @@ salvo no perfil local (`perfil_proxy/`) e será reaproveitado nas próximas veze
 Depois, basta apontar seu cliente para:
 
 ```
-Base URL: http://localhost:8000/v1
+Base URL: http://localhost:4000/v1
 Model:    deepseek-chat   (aceita qualquer string, é só decorativo)
 ```
 
 ### Exemplo com curl
 
 ```bash
-curl http://localhost:8000/v1/chat/completions \
+curl http://localhost:4000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -64,7 +64,7 @@ curl http://localhost:8000/v1/chat/completions \
 ### Streaming
 
 ```bash
-curl -N http://localhost:8000/v1/chat/completions \
+curl -N http://localhost:4000/v1/chat/completions \
   -H "Content-Type: application/json" \
   -d '{
     "model": "deepseek-chat",
@@ -78,7 +78,7 @@ curl -N http://localhost:8000/v1/chat/completions \
 | Variável | Padrão | Descrição |
 |---|---|---|
 | `DEEPROXY_HOST` | `0.0.0.0` | Host onde a API escuta |
-| `DEEPROXY_PORT` | `8000` | Porta da API |
+| `DEEPROXY_PORT` | `4000` | Porta da API |
 | `DEEPROXY_TIMEOUT` | `120` | Timeout padrão por requisição (s) |
 | `DEEPROXY_MAX_TIMEOUT` | `600` | Timeout máximo permitido (s) |
 | `DEEPROXY_MODEL_NAME` | `deepseek-chat` | Nome do modelo reportado nas respostas |
