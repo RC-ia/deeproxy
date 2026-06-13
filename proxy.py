@@ -286,15 +286,27 @@ def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterato
     timeout = max(10, min(int(timeout), config.MAX_TIMEOUT))
 
     with _browser_lock:
-        # Garante que estamos no chat
+        # SEMPRE redireciona para a URL raiz — isso força o DeepSeek a criar
+        # um novo chat a cada chamada da API (cada requisição = conversa isolada).
         try:
-            if not driver.current_url.startswith(config.DEEPSEEK_URL):
-                driver.get(config.DEEPSEEK_URL)
-                time.sleep(1)
-                _click_search_button(driver)
-        except Exception:
             driver.get(config.DEEPSEEK_URL)
-            time.sleep(1)
+            # Aguarda o textarea ficar disponível na nova página
+            WebDriverWait(driver, 15).until(
+                EC.element_to_be_clickable((By.CSS_SELECTOR, "textarea"))
+            )
+        except TimeoutException:
+            # Se não achou textarea, tenta o contenteditable como fallback
+            try:
+                WebDriverWait(driver, 10).until(
+                    EC.element_to_be_clickable((By.CSS_SELECTOR, "div[contenteditable='true']"))
+                )
+            except Exception:
+                pass
+        except Exception:
+            pass
+
+        time.sleep(0.5)
+        _click_search_button(driver)
 
         # Instala o observer ANTES de submeter o prompt
         _install_observer(driver)
