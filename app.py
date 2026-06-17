@@ -18,6 +18,7 @@ Na primeira execução, faça login manualmente na janela do Chrome que abrir.
 from __future__ import annotations
 
 import json
+import re
 import time
 import traceback
 
@@ -159,13 +160,35 @@ def chat_completions():
 
     agora = int(time.time())
     
-    # Se houver tool calls em formato XML, retorna como parte do conteúdo
+    # Constrói a mensagem no formato OpenAI
+    message_data = {"role": "assistant", "content": texto}
+    
+    # Se houver tool calls, adiciona no formato OpenAI
     if tool_calls:
-        # Tool calls já estão em formato XML estruturado
-        # O cliente pode identificar e processar as tags 
-        conteudo_com_tools = texto + '\n\n' + '\n\n'.join(tool_calls) if texto else '\n\n'.join(tool_calls)
-    else:
-        conteudo_com_tools = texto
+        openai_tool_calls = []
+        for idx, xml_call in enumerate(tool_calls):
+            # Extrai nome e argumentos do XML
+            name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', xml_call)
+            if name_match:
+                tool_name = name_match.group(1)
+                # Extrai todos os parâmetros do XML
+                args = {}
+                param_matches = re.findall(r'<(\w+)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\w+>', xml_call, re.DOTALL)
+                for param_name, param_value in param_matches:
+                    if param_name != 'tool_call':  # Ignora a tag principal
+                        args[param_name.strip()] = param_value.strip()
+                
+                openai_tool_calls.append({
+                    "id": f"call_{idx + 1}",
+                    "type": "function",
+                    "function": {
+                        "name": tool_name,
+                        "arguments": json.dumps(args)
+                    }
+                })
+        
+        if openai_tool_calls:
+            message_data["tool_calls"] = openai_tool_calls
     
     return jsonify({
         "id": f"chatcmpl-{agora}",
@@ -175,8 +198,8 @@ def chat_completions():
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": conteudo_com_tools},
-                "finish_reason": "stop",
+                "message": message_data,
+                "finish_reason": "tool_calls" if tool_calls else "stop",
             }
         ],
         "usage": {
