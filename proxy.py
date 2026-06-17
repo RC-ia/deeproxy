@@ -1,10 +1,10 @@
 """
 proxy.py — núcleo do DeepProxy.
 
-Abre o DeepSeek Chat via Selenium, envia um prompt e captura a resposta.
-Suporta dois modos:
-  - send_prompt(prompt)        -> retorna a resposta completa (str)
-  - stream_prompt(prompt)      -> generator que yield deltas em tempo real
+Abre o DeepSeek Chat via Selenium, envia mensagens (formato OpenAI) e
+captura a resposta. Suporta dois modos:
+  - send_prompt(messages)      -> retorna a resposta completa (str)
+  - stream_prompt(messages)    -> generator que yield deltas em tempo real
 
 A captura incremental usa um MutationObserver injetado via JS que guarda
 os fragmentos novos numa variável window.__deepseek_deltas. O Python faz
@@ -25,6 +25,7 @@ from selenium.common.exceptions import (
     WebDriverException,
 )
 from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.chrome.service import Service as ChromeService
 from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support import expected_conditions as EC
@@ -33,44 +34,81 @@ from selenium.webdriver.support.ui import WebDriverWait
 import config
 
 
-_browser_lock = threading.Lock()
-_driver: Optional[webdriver.Chrome] = None
-
-
 # ---------------------------------------------------------------------------
-# Lifecycle
+# Account Pool — gerencia múltiplos drivers (um por conta/projeto)
 # ---------------------------------------------------------------------------
 
-def _build_options() -> Options:
-    opts = Options()
-    opts.add_argument(f"--user-data-dir={os.path.abspath(config.CHROME_PROFILE_DIR)}")
-    opts.add_argument("--window-size=1100,900")
-    opts.add_experimental_option("excludeSwitches", ["enable-automation"])
-    opts.add_experimental_option("useAutomationExtension", False)
-    return opts
+class AccountPool:
+    """Pool de navegadores Chrome, um por conta configurada.
 
+    Cada conta tem seu próprio perfil Chrome (login persistente) e
+    seu próprio lock, permitindo que requisições paralelas usem
+    contas diferentes simultaneamente.
+    """
 
-def get_driver() -> webdriver.Chrome:
-    global _driver
-    with _browser_lock:
-        if _driver is None:
-            print("[Proxy] 🚀 Iniciando Chrome...")
-            _driver = webdriver.Chrome(options=_build_options())
-            _driver.set_script_timeout(config.MAX_TIMEOUT)
-            _driver.get(config.DEEPSEEK_URL)
-            print(f"[Proxy] 🟢 Navegador pronto. Faça login manualmente em {config.DEEPSEEK_URL}")
-        return _driver
+    def __init__(self) -> None:
+        self._drivers: dict[str, webdriver.Chrome] = {}
+        self._locks: dict[str, threading.Lock] = {
+            name: threading.Lock() for name in config.ACCOUNTS
+        }
+        self._rr_index = 0
+        self._rr_lock = threading.Lock()
 
+    # ------------------------------------------------------------------
+    # Lifecycle
+    # ------------------------------------------------------------------
 
-def shutdown() -> None:
-    global _driver
-    with _browser_lock:
-        if _driver is not None:
+    def get_driver(self, account: str | None = None) -> tuple[str, webdriver.Chrome]:
+        """Retorna (nome_da_conta, driver) para a conta solicitada.
+
+        Se ``account`` for None ou não existir, faz round-robin entre
+        as contas disponíveis.
+        """
+        names = list(config.ACCOUNTS.keys())
+        if account and account in names:
+            name = account
+        else:
+            with self._rr_lock:
+                name = names[self._rr_index % len(names)]
+                self._rr_index += 1
+
+        driver = self._drivers.get(name)
+        if driver is None:
+            profile = os.path.abspath(config.ACCOUNTS[name])
+            print(f"[Proxy] 🚀 Iniciando Chrome para conta '{name}' (perfil: {profile})...")
+            opts = Options()
+            opts.add_argument(f"--user-data-dir={profile}")
+            opts.add_argument("--window-size=1100,900")
+            opts.add_argument("--no-first-run")
+            opts.add_argument("--disable-default-apps")
+            opts.add_argument("--remote-debugging-port=0")
+            opts.add_experimental_option("excludeSwitches", ["enable-automation"])
+            opts.add_experimental_option("useAutomationExtension", False)
             try:
-                _driver.quit()
+                driver = webdriver.Chrome(options=opts)
+            except Exception as e:
+                import traceback as _tb
+                _tb.print_exc()
+                raise
+            driver.set_script_timeout(config.MAX_TIMEOUT)
+            driver.get(config.DEEPSEEK_URL)
+            print(f"[Proxy] 🟢 Conta '{name}' pronta. Faça login manualmente em {config.DEEPSEEK_URL}")
+            self._drivers[name] = driver
+        return name, driver
+
+    def get_lock(self, account: str) -> threading.Lock:
+        return self._locks[account]
+
+    def shutdown(self) -> None:
+        for name, driver in self._drivers.items():
+            try:
+                driver.quit()
             except Exception:
                 pass
-            _driver = None
+        self._drivers.clear()
+
+
+pool = AccountPool()
 
 
 def _click_search_button(driver: webdriver.Chrome) -> None:
@@ -80,6 +118,27 @@ def _click_search_button(driver: webdriver.Chrome) -> None:
     if (btn) { btn.click(); return true; }
     return false;
     """
+    try:
+        driver.execute_script(js)
+    except Exception:
+        pass
+
+
+def _click_alternate_button(driver: webdriver.Chrome) -> None:
+    js = """
+(function() {
+  const botaoNaoSelecionado = document.querySelector('._9f2341b._7ac2123:not(._31a22b0)');
+  if (botaoNaoSelecionado) {
+    const rect = botaoNaoSelecionado.getBoundingClientRect();
+    const x = rect.left + (rect.width / 2);
+    const y = rect.top + (rect.height / 2);
+    const options = { bubbles: true, cancelable: true, view: window, clientX: x, clientY: y };
+    botaoNaoSelecionado.dispatchEvent(new MouseEvent('mousedown', options));
+    botaoNaoSelecionado.dispatchEvent(new MouseEvent('mouseup', options));
+    botaoNaoSelecionado.dispatchEvent(new MouseEvent('click', options));
+  }
+})();
+"""
     try:
         driver.execute_script(js)
     except Exception:
@@ -98,7 +157,7 @@ def _find_textarea(driver: webdriver.Chrome):
     ]
     for by, sel in candidatos:
         try:
-            el = WebDriverWait(driver, 10).until(
+            el = WebDriverWait(driver, 3).until(
                 EC.element_to_be_clickable((by, sel))
             )
             return el
@@ -110,7 +169,7 @@ def _find_textarea(driver: webdriver.Chrome):
 def _inject_prompt(driver: webdriver.Chrome, prompt: str) -> None:
     textarea = _find_textarea(driver)
     textarea.click()
-    time.sleep(0.2)
+    time.sleep(0.05)
     driver.execute_script(
         """
         const el = arguments[0];
@@ -276,24 +335,78 @@ def _limpar_resposta(texto: str) -> str:
 
 
 # ---------------------------------------------------------------------------
+# Message parsing (from OpenAI format to plain text prompt)
+# ---------------------------------------------------------------------------
+
+def _extract_last_user_prompt(messages: list) -> str:
+    if not messages:
+        raise ValueError("'messages' está vazio.")
+
+    _clean = re.compile(r'<system-reminder>.*?</system-reminder>', re.DOTALL)
+
+    users = [m for m in messages if m.get("role") == "user"]
+    if len(messages) == 1 and len(users) == 1:
+        return _clean.sub("", str(users[0].get("content", "")))
+
+    linhas = []
+    primeiro_user = False
+    for m in messages:
+        role = m.get("role", "user")
+        content = _clean.sub("", m.get("content") or "")
+        if role == "system":
+            linhas.append(f"[System]\n{content}\n")
+            continue
+        elif role == "user":
+            if not primeiro_user:
+                primeiro_user = True
+            linhas.append(f"[User]\n{content}\n")
+        elif role == "assistant":
+            if not primeiro_user:
+                continue
+            bloco = f"[Assistant]\n{content}\n" if content else "[Assistant]\n"
+            for tc in (m.get("tool_calls") or []):
+                func = tc.get("function", {})
+                name = func.get("name", "")
+                args = func.get("arguments", "{}")
+                bloco += f"[Tool Call]: {name}\n\nArguments: {args}\n"
+            linhas.append(bloco)
+        elif role == "tool":
+            if not primeiro_user:
+                continue
+            tool_name = m.get("name") or "tool"
+            linhas.append(f"[Tool Result ({tool_name})]\n{content}\n")
+    return "\n".join(linhas).strip()
+
+
+# ---------------------------------------------------------------------------
 # API pública
 # ---------------------------------------------------------------------------
 
-def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterator[str]:
+def stream_prompt(
+    messages: list,
+    timeout: int = config.DEFAULT_TIMEOUT,
+    account: str | None = None,
+) -> Iterator[str]:
     """
-    Envia um prompt ao DeepSeek e yield deltas de texto em tempo real.
+    Envia mensagens (formato OpenAI) ao DeepSeek e yield deltas de texto em tempo real.
 
     Cada yield é um fragmento (string) novo que apareceu na resposta.
     O generator termina quando o DeepSeek acaba de gerar.
+
+    Parâmetros:
+        messages: histórico no formato OpenAI.
+        timeout: timeout máximo em segundos.
+        account: nome da conta a usar (ou None para round-robin).
     """
-    driver = get_driver()
+    prompt = _extract_last_user_prompt(messages)
+    account_name, driver = pool.get_driver(account)
     prompt = (prompt or "").strip()
     if not prompt:
         raise ValueError("Prompt vazio.")
 
     timeout = max(10, min(int(timeout), config.MAX_TIMEOUT))
 
-    with _browser_lock:
+    with pool.get_lock(account_name):
         # SEMPRE redireciona para a URL raiz — isso força o DeepSeek a criar
         # um novo chat a cada chamada da API (cada requisição = conversa isolada).
         try:
@@ -313,14 +426,15 @@ def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterato
         except Exception:
             pass
 
-        time.sleep(0.5)
+        time.sleep(0.1)
         _click_search_button(driver)
+        _click_alternate_button(driver)
 
         # Instala o observer ANTES de submeter o prompt
         _install_observer(driver)
 
         _inject_prompt(driver, prompt)
-        time.sleep(0.3)
+        time.sleep(0.05)
         _submit_prompt(driver)
 
         deadline = time.time() + timeout
@@ -378,12 +492,16 @@ def stream_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> Iterato
             _stop_observer(driver)
 
 
-def send_prompt(prompt: str, timeout: int = config.DEFAULT_TIMEOUT) -> str:
+def send_prompt(
+    messages: list,
+    timeout: int = config.DEFAULT_TIMEOUT,
+    account: str | None = None,
+) -> str:
     """
     Modo não-streaming: concatena todos os deltas e retorna a resposta completa.
     """
     partes = []
-    for delta in stream_prompt(prompt, timeout=timeout):
+    for delta in stream_prompt(messages, timeout=timeout, account=account):
         partes.append(delta)
     texto = "".join(partes)
     if not texto:

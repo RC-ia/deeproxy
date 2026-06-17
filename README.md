@@ -19,10 +19,26 @@ LiteLLM, etc.) apontando para o DeepSeek **sem precisar de chave de API oficial*
           │  digita o prompt
           ▼
    chat.deepseek.com
-          │  captura a resposta
+          │  captura a resposta via MutationObserver
           ▼
-    resposta JSON (SSE se stream=true)
+    bufferiza tudo → analisa → reproduz a 250 tk/s
+          │
+          ├─ se for tool_call → stream só a estrutura tool_call
+          └─ se for texto → stream do texto limpo
 ```
+
+## Funcionalidades
+
+- **Streaming real**: captura a resposta do DeepSeek via `MutationObserver` injetado, delta por delta
+- **Tool calls automáticas**: detecta chamadas de ferramenta na resposta do modelo e converte para o formato OpenAI nativo
+- **Formatos de tool call suportados**:
+  - XML com atributo: `<tool_call name="x"> <arg>val</arg> </tool_call>`
+  - XML com sub-tag `<name>`: `<skill> <name>x</name> <param>val</param> </skill>`
+  - JSON blocks: `{"name": "x", "arguments": {...}}`
+  - Texto: `[Tool Call]: x\n\nArguments: {"key": "val"}`
+- **250 tk/s simulado**: a resposta é bufferizada e reproduzida a 250 tokens/s para o cliente
+- **Histórico multi-turno**: suporta `role: system`, `user`, `assistant` e `tool`
+- **Persistência de login**: perfil Chrome salvo entre execuções
 
 ## Instalação
 
@@ -73,6 +89,18 @@ curl -N http://localhost:4000/v1/chat/completions \
   }'
 ```
 
+### Tool calls
+
+```bash
+curl -N http://localhost:4000/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "deepseek-chat",
+    "stream": true,
+    "messages": [{"role": "user", "content": "Adicione 'estudar' na minha lista de tarefas."}]
+  }'
+```
+
 ## Variáveis de ambiente
 
 | Variável | Padrão | Descrição |
@@ -104,13 +132,9 @@ curl -N http://localhost:4000/v1/chat/completions \
 
 ```
 deeproxy/
-├── app.py            # Flask + rotas
-├── proxy.py          # Lógica Selenium
-├── config.py         # Configurações
+├── app.py            # Flask + rotas + parsers de tool call
+├── proxy.py          # Lógica Selenium + MutationObserver
+├── config.py         # Configurações via env
 ├── requirements.txt
 └── README.md
 ```
-
-## Licença
-
-MIT
