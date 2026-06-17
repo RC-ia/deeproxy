@@ -17,8 +17,6 @@ __pycache__/
 # Editors
 .vscode/
 .idea/
-*.swp
-*.swo
 
 # Dependencies
 .venv/
@@ -29,4 +27,8 @@ node_modules/
 dist/
 build/
 target/
+
+# OS generated files
+.DS_Store
+Thumbs.db
 ```

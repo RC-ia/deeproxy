@@ -43,7 +43,7 @@ import config
 # ---------------------------------------------------------------------------
 
 class ToolCallParser:
-    """
+    r"""
     Parser próprio para detectar tool calls na resposta do DeepSeek e
     formatá-los no estilo XML estruturado para o cliente reconhecer.
     
