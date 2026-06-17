@@ -166,37 +166,66 @@ class ToolCallParser:
         tool_calls_xml = []
         cleaned_text = text
         
-        # Padrão 1: <tool_call name="x"> seguido de JSON ou tags XML
-        # Pattern melhorado para capturar até o fim do conteúdo (JSON ou XML)
-        # Primeiro verifica se existe pelo menos um tool_call
-        if '<tool_call' not in cleaned_text.lower():
-            pass  # Pula para os próximos padrões
-        else:
-            # Encontra a posição do primeiro <tool_call
-            first_tool = cleaned_text.lower().find('<tool_call')
-            # Pega todo o conteúdo desde o primeiro tool_call até o fim
-            content_from_tool = cleaned_text[first_tool:]
-            
-            # Extrai o nome da ferramenta
-            name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', content_from_tool, re.IGNORECASE)
-            if name_match:
-                name = name_match.group(1).strip()
-                # O conteúdo é tudo depois da tag de abertura
-                content_start = content_from_tool.find('>') + 1
-                content = content_from_tool[content_start:].strip()
+        # Padrão 1: <tool_call name="x"> seguido de tags XML internas (ex: <file_path>...</file_path><content>...</content>)
+        # Este é o formato principal que queremos capturar
+        pattern_xml_params = r'<tool_call\s+name=["\']([^"\']+)["\']>\s*((?:<\w+>(?:<!\[CDATA\[.*?\]\]>|[^<]*)</\w+>\s*)+)'
+        
+        matches = re.finditer(pattern_xml_params, cleaned_text, re.DOTALL | re.IGNORECASE)
+        matches_list = list(matches)
+        
+        if matches_list:
+            for match in reversed(matches_list):  # Processa de trás pra frente para não mexer nos índices
+                tool_name = match.group(1).strip()
+                content_block = match.group(2).strip()
                 
-                args = self._extract_json_from_content(content)
-                if not args and content:
-                    arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
-                    if arg_matches:
-                        args = {k: v.strip() for k, v in arg_matches}
-                    else:
-                        args = {"raw": content}
+                # Extrai parâmetros das tags XML - pattern melhorado para CDATA
+                args = {}
+                # Primeiro tenta encontrar tags com CDATA
+                cdata_pattern = r'<(\w+)><!\[CDATA\[(.*?)\]\]></\w+>'
+                cdata_matches = re.findall(cdata_pattern, content_block, re.DOTALL)
+                for param_name, param_value in cdata_matches:
+                    args[param_name.strip()] = param_value.strip()
                 
-                xml_formatted = self._normalize_tool_call_to_xml(name, args)
-                tool_calls_xml.append(xml_formatted)
-                # Remove todo o conteúdo desde o primeiro tool_call
-                cleaned_text = cleaned_text[:first_tool]
+                # Depois encontra tags simples sem CDATA (que não estejam dentro do conteúdo CDATA)
+                # Para evitar capturar tags HTML dentro do CDATA, removemos primeiro o conteúdo CDATA
+                content_without_cdata = re.sub(r'<!\[CDATA\[.*?\]\]>', '', content_block, flags=re.DOTALL)
+                simple_pattern = r'<(\w+)>([^<]*)</\w+>'
+                simple_matches = re.findall(simple_pattern, content_without_cdata)
+                for param_name, param_value in simple_matches:
+                    # Só adiciona se ainda não estiver em args (evita duplicatas)
+                    if param_name not in args:
+                        args[param_name.strip()] = param_value.strip()
+                
+                if args:
+                    xml_formatted = self._normalize_tool_call_to_xml(tool_name, args)
+                    tool_calls_xml.insert(0, xml_formatted)  # Insere no início para manter ordem
+                    # Remove o bloco tool_call do texto
+                    cleaned_text = cleaned_text.replace(match.group(0), '')
+        
+        # Se não encontrou no formato XML com params, tenta o formato mais simples
+        if not tool_calls_xml:
+            # Padrão alternativo: <tool_call name="x"> seguido de JSON ou conteúdo até o fim
+            if '<tool_call' in cleaned_text.lower():
+                first_tool = cleaned_text.lower().find('<tool_call')
+                content_from_tool = cleaned_text[first_tool:]
+                
+                name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', content_from_tool, re.IGNORECASE)
+                if name_match:
+                    name = name_match.group(1).strip()
+                    content_start = content_from_tool.find('>') + 1
+                    content = content_from_tool[content_start:].strip()
+                    
+                    args = self._extract_json_from_content(content)
+                    if not args and content:
+                        arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
+                        if arg_matches:
+                            args = {k: v.strip() for k, v in arg_matches}
+                        else:
+                            args = {"raw": content}
+                    
+                    xml_formatted = self._normalize_tool_call_to_xml(name, args)
+                    tool_calls_xml.append(xml_formatted)
+                    cleaned_text = cleaned_text[:first_tool]
         
         # Padrão 2: Formato JSON {\"name\": \"x\", \"arguments\": {...}}
         json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'

@@ -120,13 +120,68 @@ def chat_completions():
                 "choices": [{"index": 0, **kw}],
             }) + "\n\n"
 
+        def _extract_clean_text(text: str) -> str:
+            """Extrai apenas o texto limpo, removendo tool calls."""
+            if not text:
+                return ""
+            clean, _ = proxy.tool_parser.parse_and_format_tools(text)
+            return clean
+
         def gerar():
             yield _chunk(delta={"role": "assistant"}, finish_reason=None)
 
+            accumulated_text = ""
+            tool_calls_detected = []
+            
             try:
                 for delta in proxy.stream_prompt(messages, timeout=timeout, account=account):
                     if delta:
-                        yield _chunk(delta={"content": delta}, finish_reason=None)
+                        accumulated_text += delta
+                        
+                        # Tenta detectar tool calls no texto acumulado
+                        texto_limpo, tool_calls_xml = proxy.tool_parser.parse_and_format_tools(accumulated_text)
+                        
+                        # Se encontrou novas tool calls, processa-as
+                        if len(tool_calls_xml) > len(tool_calls_detected):
+                            # Extrai e envia as novas tool calls no formato OpenAI
+                            for idx, xml_call in enumerate(tool_calls_xml[len(tool_calls_detected):]):
+                                name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', xml_call)
+                                if name_match:
+                                    tool_name = name_match.group(1)
+                                    args = {}
+                                    param_matches = re.findall(r'<(\w+)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\w+>', xml_call, re.DOTALL)
+                                    for param_name, param_value in param_matches:
+                                        if param_name != 'tool_call':
+                                            args[param_name.strip()] = param_value.strip()
+                                    
+                                    # Envia tool call no formato OpenAI
+                                    tool_index = len(tool_calls_detected)
+                                    yield _chunk(
+                                        delta={
+                                            "tool_calls": [{
+                                                "index": tool_index,
+                                                "id": f"call_{tool_index + 1}",
+                                                "type": "function",
+                                                "function": {
+                                                    "name": tool_name,
+                                                    "arguments": json.dumps(args)
+                                                }
+                                            }]
+                                        },
+                                        finish_reason=None
+                                    )
+                            tool_calls_detected = tool_calls_xml
+                        
+                        # Envia apenas o texto limpo (sem tool calls)
+                        if texto_limpo:
+                            # Envia apenas o delta de texto novo
+                            previous_clean = _extract_clean_text(accumulated_text[:-len(delta)] if len(delta) < len(accumulated_text) else "")
+                            current_clean = texto_limpo
+                            if len(current_clean) > len(previous_clean):
+                                text_delta = current_clean[len(previous_clean):]
+                                if text_delta:
+                                    yield _chunk(delta={"content": text_delta}, finish_reason=None)
+                            
             except TimeoutError as e:
                 yield _chunk(delta={"content": f"\n\n[ERRO: {e}]"}, finish_reason="stop")
                 yield "data: [DONE]\n\n"
@@ -137,7 +192,9 @@ def chat_completions():
                 yield "data: [DONE]\n\n"
                 return
 
-            yield _chunk(delta={}, finish_reason="stop")
+            # Finaliza com finish_reason adequado
+            finish_reason = "tool_calls" if tool_calls_detected else "stop"
+            yield _chunk(delta={}, finish_reason=finish_reason)
             yield "data: [DONE]\n\n"
 
         return Response(gerar(), mimetype="text/event-stream")
