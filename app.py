@@ -3,7 +3,6 @@ DeepProxy — API compatível com OpenAI Chat Completions que encaminha
 requisições para o chat.deepseek.com via Selenium.
 
 Endpoints:
-  GET  /                      -> Chat UI (interface web)
   GET  /v1/models             -> lista de modelos (apenas 1: deepseek-chat)
   POST /v1/chat/completions   -> Chat Completions (com suporte a stream REAL)
   POST /tools/call            -> Executa uma ferramenta
@@ -22,7 +21,7 @@ import json
 import time
 import traceback
 
-from flask import Flask, Response, jsonify, request, send_from_directory
+from flask import Flask, Response, jsonify, request
 
 import config
 import proxy
@@ -35,9 +34,22 @@ app = Flask(__name__)
 # Rotas
 # ---------------------------------------------------------------------------
 
-@app.route("/", methods=["GET"])
-def chat_ui():
-    return send_from_directory("static", "chat.html")
+@app.route("/health", methods=["GET"])
+def health():
+    accounts_info: dict[str, dict] = {}
+    for name in config.ACCOUNTS:
+        driver = proxy.pool._drivers.get(name)
+        accounts_info[name] = {
+            "ready": driver is not None,
+            "profile": config.ACCOUNTS[name],
+        }
+    return jsonify({
+        "status": "ok",
+        "service": "deeproxy",
+        "model": config.REPORTED_MODEL,
+        "deepseek_url": config.DEEPSEEK_URL,
+        "accounts": accounts_info,
+    })
 
 
 @app.route("/tools/schema", methods=["GET"])
@@ -56,23 +68,6 @@ def tool_call():
         return jsonify({"success": False, "error": "Campo 'name' é obrigatório."}), 400
     result = tools.execute_tool(name, args)
     return jsonify(result)
-
-@app.route("/health", methods=["GET"])
-def health():
-    accounts_info: dict[str, dict] = {}
-    for name in config.ACCOUNTS:
-        driver = proxy.pool._drivers.get(name)
-        accounts_info[name] = {
-            "ready": driver is not None,
-            "profile": config.ACCOUNTS[name],
-        }
-    return jsonify({
-        "status": "ok",
-        "service": "deeproxy",
-        "model": config.REPORTED_MODEL,
-        "deepseek_url": config.DEEPSEEK_URL,
-        "accounts": accounts_info,
-    })
 
 
 @app.route("/v1/models", methods=["GET"])
@@ -148,7 +143,7 @@ def chat_completions():
 
     # --- NÃO-STREAMING ---
     try:
-        texto = proxy.send_prompt(messages, timeout=timeout, account=account)
+        texto, tool_calls = proxy.send_prompt(messages, timeout=timeout, account=account)
     except TimeoutError as e:
         return jsonify({"error": {"message": str(e), "type": "timeout_error"}}), 504
     except ValueError as e:
@@ -163,6 +158,29 @@ def chat_completions():
         }), 500
 
     agora = int(time.time())
+    
+    # Se houver tool calls, retornar no formato OpenAI com tool_calls
+    if tool_calls:
+        return jsonify({
+            "id": f"chatcmpl-{agora}",
+            "object": "chat.completion",
+            "created": agora,
+            "model": model,
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
+                    "finish_reason": "tool_calls",
+                }
+            ],
+            "usage": {
+                "prompt_tokens": 0,
+                "completion_tokens": 0,
+                "total_tokens": 0,
+            },
+        })
+    
+    # Caso contrário, retornar apenas o conteúdo de texto
     return jsonify({
         "id": f"chatcmpl-{agora}",
         "object": "chat.completion",

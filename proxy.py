@@ -1,7 +1,7 @@
 """
 proxy.py — núcleo do DeepProxy.
 
-Abre o DeepSeek Chat via Selenium, envia mensagens (formato OpenAI) e
+Abre o DeepSeek Chat via Selenium, envia mensagens (formato texto puro) e
 captura a resposta. Suporta dois modos:
   - send_prompt(messages)      -> retorna a resposta completa (str)
   - stream_prompt(messages)    -> generator que yield deltas em tempo real
@@ -9,14 +9,17 @@ captura a resposta. Suporta dois modos:
 A captura incremental usa um MutationObserver injetado via JS que guarda
 os fragmentos novos numa variável window.__deepseek_deltas. O Python faz
 polling dessa variável a cada ~200ms e repassa os deltas ao cliente.
+
+Este módulo inclui um parser próprio para detectar tool calls na resposta.
 """
 from __future__ import annotations
 
+import json
 import os
 import re
 import threading
 import time
-from typing import Iterator, Optional
+from typing import Any, Iterator, Optional
 
 from selenium import webdriver
 from selenium.common.exceptions import (
@@ -32,6 +35,7 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import config
+import parser
 
 
 # ---------------------------------------------------------------------------
@@ -496,9 +500,12 @@ def send_prompt(
     messages: list,
     timeout: int = config.DEFAULT_TIMEOUT,
     account: str | None = None,
-) -> str:
+) -> tuple[str, list[dict[str, Any]]]:
     """
     Modo não-streaming: concatena todos os deltas e retorna a resposta completa.
+    
+    Retorna uma tupla (texto_resposta, tool_calls) onde tool_calls é uma lista
+    no formato OpenAI (pode ser vazia se nenhum tool call for detectado).
     """
     partes = []
     for delta in stream_prompt(messages, timeout=timeout, account=account):
@@ -506,4 +513,21 @@ def send_prompt(
     texto = "".join(partes)
     if not texto:
         raise RuntimeError("Resposta do DeepSeek veio vazia.")
-    return _limpar_resposta(texto)
+    
+    texto_limpo = _limpar_resposta(texto)
+    tool_calls = parser.parse_tool_calls_from_text(texto_limpo)
+    
+    return texto_limpo, tool_calls
+
+
+def send_prompt_with_tools(
+    messages: list,
+    timeout: int = config.DEFAULT_TIMEOUT,
+    account: str | None = None,
+) -> str:
+    """
+    Modo não-streaming simplificado: retorna apenas o texto da resposta.
+    Mantido para compatibilidade com chamadas que não precisam de tool calls.
+    """
+    texto, _ = send_prompt(messages, timeout=timeout, account=account)
+    return texto
