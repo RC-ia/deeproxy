@@ -10,7 +10,8 @@ A captura incremental usa um MutationObserver injetado via JS que guarda
 os fragmentos novos numa variável window.__deepseek_deltas. O Python faz
 polling dessa variável a cada ~200ms e repassa os deltas ao cliente.
 
-Este módulo inclui um parser próprio para detectar tool calls na resposta.
+Este módulo inclui um parser próprio para detectar e formatar tool calls
+no formato XML estruturado para o cliente reconhecer.
 """
 from __future__ import annotations
 
@@ -38,135 +39,165 @@ import config
 
 
 # ---------------------------------------------------------------------------
-# Parser próprio para detectar tool calls na resposta do DeepSeek
+# Parser próprio para detectar e formatar tool calls no formato XML
 # ---------------------------------------------------------------------------
 
-def _build_tool_call(name: str, args: str | dict, call_id_counter: list[int]) -> dict[str, Any]:
-    """Constrói um tool call no formato OpenAI."""
-    call_id = f"call_{call_id_counter[0]}"
-    call_id_counter[0] += 1
-    
-    if isinstance(args, str):
-        args_str = args
-    else:
-        args_str = json.dumps(args)
-    
-    return {
-        "id": call_id,
-        "type": "function",
-        "function": {
-            "name": name,
-            "arguments": args_str,
-        },
-    }
-
-
-def _extract_json_from_content(content: str) -> dict:
-    """Extrai JSON de um conteúdo, lidando com braces aninhados."""
-    start = content.find('{')
-    if start < 0:
-        return {}
-    
-    count = 0
-    end = start
-    for i, c in enumerate(content[start:], start):
-        if c == '{':
-            count += 1
-        elif c == '}':
-            count -= 1
-            if count == 0:
-                end = i + 1
-                break
-    
-    json_str = content[start:end]
-    try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
-        # Tenta corrigir escapes comuns (ex: \U em caminhos Windows)
-        try:
-            json_str_fixed = json_str.replace('\\', '\\\\')
-            return json.loads(json_str_fixed)
-        except json.JSONDecodeError:
-            return {"raw": content.strip()}
-
-
-def _parse_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
+class ToolCallParser:
     """
-    Extrai tool calls de um texto de resposta do DeepSeek.
+    Parser próprio para detectar tool calls na resposta do DeepSeek e
+    formatá-los no estilo XML estruturado para o cliente reconhecer.
     
-    Retorna uma lista de tool calls no formato OpenAI:
-    [
-      {
-        "id": "call_abc123",
-        "type": "function",
-        "function": {
-          "name": "nome_da_ferramenta",
-          "arguments": "{\"arg\": \"val\"}"
-        }
-      },
-      ...
-    ]
+    Formato de saída:
+    <tool_call name="write_file">
+    <filepath>C:\Users\file.html</filepath>
+    <content><![CDATA[...]]></content>
+    
     """
-    tool_calls = []
-    call_id_counter = [0]
     
-    # 1. Tentar XML com atributo name: <tool_call name="x"> seguido de JSON ou conteudo
-    xml_attr_pattern = r'<tool_call\s+name=["\']([^"\']+)["\']\s*>([\s\S]*)'
-    for match in re.finditer(xml_attr_pattern, text, re.IGNORECASE):
-        name = match.group(1).strip()
-        content = match.group(2).strip()
-        
-        args = _extract_json_from_content(content)
-        if not args and content:
-            # Tenta extrair tags XML internas como <arg>val</arg>
-            arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
-            if arg_matches:
-                args = {k: v.strip() for k, v in arg_matches}
-            else:
-                args = {"raw": content}
-        
-        tool_calls.append(_build_tool_call(name, args, call_id_counter))
+    def __init__(self):
+        self._call_id_counter = 0
     
-    # 2. Tentar XML com sub-tag <name>: <skill>...<name>x</name>...</skill>
-    xml_tag_pattern = r'<(\w+)>\s*<name>([^<]+)</name>(.*?)</\1>'
-    for match in re.finditer(xml_tag_pattern, text, re.DOTALL | re.IGNORECASE):
-        tag_name = match.group(1)
-        func_name = match.group(2).strip()
-        content = match.group(3).strip()
-        
-        args = _extract_json_from_content(content)
-        if not args:
-            param_matches = re.findall(r'<(\w+)>([^<]*)</\1>', content)
-            if param_matches:
-                args = {k: v.strip() for k, v in param_matches}
-            else:
-                args = {"raw": content}
-        
-        tool_calls.append(_build_tool_call(func_name, args, call_id_counter))
+    def _reset_counter(self):
+        self._call_id_counter = 0
     
-    # 3. Tentar JSON blocks: {"name": "x", "arguments": {...}}
-    json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'
-    for match in re.finditer(json_block_pattern, text, re.DOTALL):
-        name = match.group(1).strip()
-        args_str = match.group(2).strip()
+    def _generate_call_id(self) -> str:
+        self._call_id_counter += 1
+        return f"call_{self._call_id_counter}"
+    
+    def _extract_json_from_content(self, content: str) -> dict:
+        """Extrai JSON de um conteúdo, lidando com braces aninhados."""
+        start = content.find('{')
+        if start < 0:
+            return {}
+        
+        count = 0
+        end = start
+        for i, c in enumerate(content[start:], start):
+            if c == '{':
+                count += 1
+            elif c == '}':
+                count -= 1
+                if count == 0:
+                    end = i + 1
+                    break
+        
+        json_str = content[start:end]
         try:
-            args = json.loads(args_str)
+            return json.loads(json_str)
         except json.JSONDecodeError:
-            args = {"raw": args_str}
-        tool_calls.append(_build_tool_call(name, args, call_id_counter))
+            # Tenta corrigir escapes comuns (ex: \U em caminhos Windows)
+            try:
+                json_str_fixed = json_str.replace('\\\\', '\\\\\\\\')
+                return json.loads(json_str_fixed)
+            except json.JSONDecodeError:
+                return {"raw": content.strip()}
     
-    # 4. Tentar formato de texto: [Tool Call]: nome\n\nArguments: {...}
-    text_pattern = r'\[Tool Call\]:\s*([^\n]+)\s*\n\s*\n?\s*Arguments?:\s*(\{[^{}]*\})?'
-    for match in re.finditer(text_pattern, text, re.IGNORECASE):
-        name = match.group(1).strip()
-        args_str = match.group(2) if match.group(2) else "{}"
-        try:
-            args = json.loads(args_str)
-        except json.JSONDecodeError:
-            args = {"raw": args_str}
-        tool_calls.append(_build_tool_call(name, args, call_id_counter))
+    def _normalize_tool_call_to_xml(self, name: str, args: dict | str) -> str:
+        """
+        Converte um tool call para o formato XML estruturado.
+        
+        Args:
+            name: nome da ferramenta
+            args: argumentos como dict ou string JSON
+            
+        Returns:
+            String formatada no estilo XML com CDATA para conteúdo
+        """
+        if isinstance(args, str):
+            try:
+                args_dict = json.loads(args)
+            except json.JSONDecodeError:
+                args_dict = {"raw": args}
+        else:
+            args_dict = args
+        
+        # Constrói o XML com tags apropriadas
+        xml_parts = [f'<tool_call name="{name}">']
+        
+        # Ordena as chaves para consistência, colocando filepath/content primeiro se existirem
+        priority_keys = ['filepath', 'path', 'file_path', 'content', 'code']
+        other_keys = [k for k in args_dict.keys() if k not in priority_keys]
+        sorted_keys = [k for k in priority_keys if k in args_dict] + other_keys
+        
+        for key in sorted_keys:
+            value = args_dict[key]
+            if isinstance(value, str) and ('<' in value or '>' in value or len(value) > 100):
+                # Usa CDATA para conteúdo grande ou com caracteres especiais
+                xml_parts.append(f'<{key}><![CDATA[{value}]]></{key}>')
+            else:
+                xml_parts.append(f'<{key}>{value}</{key}>')
+        
+        xml_parts.append('')
+        return '\n'.join(xml_parts)
     
-    return tool_calls
+    def parse_and_format_tools(self, text: str) -> tuple[str, list[str]]:
+        """
+        Extrai tool calls do texto e os formata no estilo XML.
+        
+        Args:
+            text: texto da resposta do DeepSeek
+            
+        Returns:
+            Tupla (texto_sem_tools, lista_de_tool_calls_xml)
+        """
+        self._reset_counter()
+        tool_calls_xml = []
+        cleaned_text = text
+        
+        # Padrão 1: <tool_call name="x"> seguido de JSON ou tags XML
+        xml_attr_pattern = r'<tool_call\s+name=["\']([^"\']+)["\']\s*>([\s\S]*?)(?:|$)'
+        for match in re.finditer(xml_attr_pattern, cleaned_text, re.IGNORECASE):
+            full_match = match.group(0)
+            name = match.group(1).strip()
+            content = match.group(2).strip()
+            
+            args = self._extract_json_from_content(content)
+            if not args and content:
+                arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
+                if arg_matches:
+                    args = {k: v.strip() for k, v in arg_matches}
+                else:
+                    args = {"raw": content}
+            
+            xml_formatted = self._normalize_tool_call_to_xml(name, args)
+            tool_calls_xml.append(xml_formatted)
+            cleaned_text = cleaned_text.replace(full_match, '')
+        
+        # Padrão 2: Formato JSON {"name": "x", "arguments": {...}}
+        json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'
+        for match in re.finditer(json_block_pattern, cleaned_text, re.DOTALL):
+            full_match = match.group(0)
+            name = match.group(1).strip()
+            args_str = match.group(2).strip()
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError:
+                args = {"raw": args_str}
+            
+            xml_formatted = self._normalize_tool_call_to_xml(name, args)
+            tool_calls_xml.append(xml_formatted)
+            cleaned_text = cleaned_text.replace(full_match, '')
+        
+        # Padrão 3: [Tool Call]: nome\n\nArguments: {...}
+        text_pattern = r'\[Tool Call\]:\s*([^\n]+)\s*\n\s*\n?\s*Arguments?:\s*(\{[^{}]*\})?'
+        for match in re.finditer(text_pattern, cleaned_text, re.IGNORECASE):
+            full_match = match.group(0)
+            name = match.group(1).strip()
+            args_str = match.group(2) if match.group(2) else "{}"
+            try:
+                args = json.loads(args_str)
+            except json.JSONDecodeError:
+                args = {"raw": args_str}
+            
+            xml_formatted = self._normalize_tool_call_to_xml(name, args)
+            tool_calls_xml.append(xml_formatted)
+            cleaned_text = cleaned_text.replace(full_match, '')
+        
+        return cleaned_text.strip(), tool_calls_xml
+
+
+# Instância global do parser
+tool_parser = ToolCallParser()
 
 
 # ---------------------------------------------------------------------------
@@ -631,12 +662,17 @@ def send_prompt(
     messages: list,
     timeout: int = config.DEFAULT_TIMEOUT,
     account: str | None = None,
-) -> tuple[str, list[dict[str, Any]]]:
+) -> tuple[str, list[str]]:
     """
     Modo não-streaming: concatena todos os deltas e retorna a resposta completa.
     
-    Retorna uma tupla (texto_resposta, tool_calls) onde tool_calls é uma lista
-    no formato OpenAI (pode ser vazia se nenhum tool call for detectado).
+    Retorna uma tupla (texto_resposta, tool_calls_xml) onde tool_calls_xml é uma lista
+    de strings formatadas no estilo XML estruturado para o cliente reconhecer.
+    Exemplo de formato:
+    <tool_call name="write_file">
+    <filepath>C:\\Users\\file.html</filepath>
+    <content><![CDATA[...]]></content>
+    
     """
     partes = []
     for delta in stream_prompt(messages, timeout=timeout, account=account):
@@ -646,9 +682,9 @@ def send_prompt(
         raise RuntimeError("Resposta do DeepSeek veio vazia.")
     
     texto_limpo = _limpar_resposta(texto)
-    tool_calls = _parse_tool_calls_from_text(texto_limpo)
+    texto_sem_tools, tool_calls_xml = tool_parser.parse_and_format_tools(texto_limpo)
     
-    return texto_limpo, tool_calls
+    return texto_sem_tools, tool_calls_xml
 
 
 def send_prompt_with_tools(
