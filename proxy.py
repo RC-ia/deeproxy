@@ -183,40 +183,59 @@ class ToolCallParser:
         tool_calls_xml = []
         cleaned_text = text
         
-        # Padrão 1: <tool_call name="x"> seguido de tags XML internas (ex: <file_path>...</file_path><content>...</content>)
-        # Este é o formato principal que queremos capturar
-        pattern_xml_params = r'<tool_call\s+name=["\']([^"\']+)["\']>\s*((?:<\w+>(?:<!\[CDATA\[.*?\]\]>|[^<]*)</\w+>\s*)+)'
+        # Padrão 1: <tool_call name="x"> seguido de tags XML internas
+        # Pattern mais simples que captura todo o conteúdo até o próximo tool_call ou fim
+        pattern_xml_params = r'<tool_call\s+name=["\']([^"\']+)["\']>(.*?)(?=<tool_call|$)'
         
         matches = re.finditer(pattern_xml_params, cleaned_text, re.DOTALL | re.IGNORECASE)
         matches_list = list(matches)
         
         if matches_list:
-            for match in reversed(matches_list):  # Processa de trás pra frente para não mexer nos índices
+            for match in reversed(matches_list):
                 tool_name = match.group(1).strip()
                 content_block = match.group(2).strip()
                 
-                # Extrai parâmetros das tags XML - pattern melhorado para CDATA
+                # Verifica se há tags abertas sem fechamento (indica stream incompleto)
+                has_unclosed_tag = bool(re.search(r'<\w+>(?!.*</\w+>)', content_block, re.DOTALL))
+                has_unclosed_cdata = bool(re.search(r'<!\[CDATA\[(?:(?!\]\]>).)*$', content_block, re.DOTALL))
+                
+                # Extrai parâmetros das tags XML
                 args = {}
-                # Primeiro tenta encontrar tags com CDATA
+                
+                # Primeiro tenta encontrar tags com CDATA completo
                 cdata_pattern = r'<(\w+)><!\[CDATA\[(.*?)\]\]></\w+>'
                 cdata_matches = re.findall(cdata_pattern, content_block, re.DOTALL)
                 for param_name, param_value in cdata_matches:
                     args[param_name.strip()] = param_value.strip()
                 
-                # Depois encontra tags simples sem CDATA (que não estejam dentro do conteúdo CDATA)
-                # Para evitar capturar tags HTML dentro do CDATA, removemos primeiro o conteúdo CDATA
+                # Depois encontra tags simples completas (evitando capturar tags dentro de HTML no CDATA)
+                # Remove primeiro o conteúdo CDATA para não capturar tags HTML internas
                 content_without_cdata = re.sub(r'<!\[CDATA\[.*?\]\]>', '', content_block, flags=re.DOTALL)
                 simple_pattern = r'<(\w+)>([^<]*)</\w+>'
                 simple_matches = re.findall(simple_pattern, content_without_cdata)
                 for param_name, param_value in simple_matches:
-                    # Só adiciona se ainda não estiver em args (evita duplicatas)
                     if param_name not in args:
                         args[param_name.strip()] = param_value.strip()
                 
                 # Se encontrou pelo menos um parâmetro válido (não vazio), processa o tool call
-                # Tags CDATA vazias ou incompletas indicam stream cortado - ignora
-                valid_params = {k: v for k, v in args.items() if v}  # Filtra valores vazios
-                if valid_params:
+                valid_params = {k: v for k, v in args.items() if v}
+                
+                # Se há tag ou CDATA incompleto, não processa como tool call completa
+                if has_unclosed_cdata or has_unclosed_tag:
+                    is_complete = False
+                else:
+                    # Verifica se há parâmetros obrigatórios para tool calls conhecidas
+                    is_complete = False
+                    if tool_name == 'write_file':
+                        has_path = any(k in valid_params for k in ['file_path', 'filepath', 'path'])
+                        has_content = 'content' in valid_params
+                        is_complete = has_path and has_content
+                    elif tool_name == 'todo_write':
+                        is_complete = 'todos' in valid_params
+                    else:
+                        is_complete = len(valid_params) > 0
+                
+                if is_complete and valid_params:
                     xml_formatted = self._normalize_tool_call_to_xml(tool_name, valid_params)
                     if xml_formatted:  # Só adiciona se não for string vazia
                         tool_calls_xml.insert(0, xml_formatted)
@@ -236,18 +255,33 @@ class ToolCallParser:
                     content_start = content_from_tool.find('>') + 1
                     content = content_from_tool[content_start:].strip()
                     
+                    # Verifica se há CDATA incompleto no conteúdo (indica stream incompleto)
+                    has_incomplete_cdata = bool(re.search(r'<!\[CDATA\[(?:(?!\]\]>).)*$', content, re.DOTALL))
+                    
                     args, is_valid_json = self._extract_json_from_content(content)
                     # Se o JSON foi extraído com sucesso (mesmo que seja {"raw": ...}), usa os args
-                    # Só tenta extrair tags XML se não houver JSON válido
-                    if not is_valid_json and content:
+                    # Só tenta extrair tags XML se não houver JSON válido e não houver CDATA incompleto
+                    if not is_valid_json and content and not has_incomplete_cdata:
                         arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
                         if arg_matches:
                             args = {k: v.strip() for k, v in arg_matches}
                     
-                    if args:
-                        xml_formatted = self._normalize_tool_call_to_xml(name, args)
-                        tool_calls_xml.append(xml_formatted)
-                        cleaned_text = cleaned_text[:first_tool]
+                    # Para write_file, verifica se tem ambos file_path e content completos
+                    if args and not has_incomplete_cdata:
+                        is_complete = False
+                        if name == 'write_file':
+                            has_path = any(k in args for k in ['file_path', 'filepath', 'path'])
+                            has_content = 'content' in args
+                            is_complete = has_path and has_content
+                        elif name == 'todo_write':
+                            is_complete = 'todos' in args
+                        else:
+                            is_complete = len(args) > 0
+                        
+                        if is_complete:
+                            xml_formatted = self._normalize_tool_call_to_xml(name, args)
+                            tool_calls_xml.append(xml_formatted)
+                            cleaned_text = cleaned_text[:first_tool]
         
         # Padrão 2: Formato JSON {\"name\": \"x\", \"arguments\": {...}}
         json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'
@@ -732,7 +766,7 @@ def stream_prompt(
                     # Só processa se tiver conteúdo suficiente ou se estiver finalizado
                     should_process = done or len(text_buffer) > 200 or '\n' in text_buffer
                     
-                    if should_process:
+                    if should_process or done:
                         # Verifica se não estamos no meio de uma tag de tool call incompleta
                         # Se o buffer terminar com "<tool_call" ou similar, espera mais dados
                         incomplete_tool_patterns = [
@@ -740,6 +774,10 @@ def stream_prompt(
                             r'<tool_call\s+name\s*$',
                             r'<tool_call\s+name="[^"]*$',
                             r'<tool_call\s+name=\'[^\']*$',
+                            r'<!\[CDATA\[(?:(?!\]\]>).)*$',  # CDATA incompleto
+                            r'<filepath>[^<]*$',  # filepath incompleto
+                            r'<content>[^<]*$',   # content tag aberta sem conteúdo
+                            r'</content>$',       # fechamento de content sem CDATA completo
                         ]
                         
                         is_incomplete = False
@@ -748,27 +786,75 @@ def stream_prompt(
                                 is_incomplete = True
                                 break
                         
+                        # Só processa se NÃO estiver incompleto OU se estiver finalizado
                         if not is_incomplete or done:
                             # Tenta parsear o buffer
                             cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
+                            
+                            # FILTRA tool calls incompletas - só envia se tiver todos os parâmetros obrigatórios
+                            valid_tool_calls = []
+                            invalid_tool_calls = []  # Mantém tool calls incompletas no buffer
+                            
+                            for tool_call_xml in tool_calls:
+                                # Verifica se é uma tool call completa
+                                is_complete = False
+                                
+                                if 'write_file' in tool_call_xml:
+                                    # write_file precisa de filepath E content com CDATA completo
+                                    has_path = any(tag in tool_call_xml for tag in ['<filepath>', '<file_path>', '<path>'])
+                                    has_content_start = '<content>' in tool_call_xml and '<![CDATA[' in tool_call_xml
+                                    has_content_end = ']]>' in tool_call_xml and '</content>' in tool_call_xml
+                                    is_complete = has_path and has_content_start and has_content_end
+                                    
+                                elif 'todo_write' in tool_call_xml:
+                                    # todo_write precisa de <todos> com array JSON completo
+                                    has_todos = '<todos>' in tool_call_xml and '</todos>' in tool_call_xml
+                                    # Verifica se o conteúdo de todos é um array JSON válido e completo
+                                    if has_todos:
+                                        todos_match = re.search(r'<todos><!\[CDATA\[(.*?)\]\]></todos>', tool_call_xml, re.DOTALL)
+                                        if todos_match:
+                                            try:
+                                                todos_data = json.loads(todos_match.group(1))
+                                                is_complete = isinstance(todos_data, list) and len(todos_data) > 0
+                                            except json.JSONDecodeError:
+                                                is_complete = False
+                                else:
+                                    # Para outras tools, considera válida se tiver pelo menos um parâmetro
+                                    is_complete = bool(re.search(r'<\w+>.+?</\w+>', tool_call_xml, re.DOTALL))
+                                
+                                if is_complete:
+                                    valid_tool_calls.append(tool_call_xml)
+                                else:
+                                    invalid_tool_calls.append(tool_call_xml)
                             
                             # Envia apenas o texto já processado (até last_processed_length)
                             new_text = cleaned_text[last_processed_length:]
                             if new_text.strip():
                                 yield {'type': 'text', 'content': new_text}
                             
-                            # Envia tool calls encontradas
-                            for tool_call_xml in tool_calls:
+                            # Envia APENAS tool calls válidas e completas
+                            for tool_call_xml in valid_tool_calls:
                                 yield {'type': 'tool_call', 'content': tool_call_xml}
                             
                             # Atualiza o último comprimento processado
                             last_processed_length = len(cleaned_text)
                             
-                            # Mantém no buffer apenas o que ainda não foi totalmente processado
-                            # (caso haja tool calls incompletas no final)
-                            if not done:
-                                # Encontra a última posição segura para cortar
-                                # Corta após o último caractere processado do texto original
+                            # Se houver tool calls inválidas/incompletas, mantém no buffer
+                            # Remove do buffer apenas o que já foi enviado como texto limpo
+                            if invalid_tool_calls and not done:
+                                # Encontra a posição da primeira tool call incompleta no buffer original
+                                # e mantém tudo a partir dali no buffer
+                                first_invalid_pos = len(text_buffer)
+                                for invalid_tc in invalid_tool_calls:
+                                    pos = text_buffer.find(invalid_tc.split('name=')[0].split('<tool_call')[0] if '<tool_call' in invalid_tc else 0)
+                                    if pos >= 0 and pos < first_invalid_pos:
+                                        first_invalid_pos = pos
+                                
+                                if first_invalid_pos < len(text_buffer):
+                                    text_buffer = text_buffer[first_invalid_pos:]
+                                    last_processed_length = max(0, last_processed_length - first_invalid_pos)
+                            elif not done:
+                                # Buffer processing normal para texto sem tool calls incompletas
                                 safe_cut_pos = len(text_buffer) - len(delta) - 50 if len(delta) > 50 else 0
                                 if safe_cut_pos > 0 and safe_cut_pos < len(text_buffer):
                                     text_buffer = text_buffer[safe_cut_pos:]
