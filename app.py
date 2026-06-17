@@ -159,28 +159,14 @@ def chat_completions():
 
     agora = int(time.time())
     
-    # Se houver tool calls, retornar no formato OpenAI com tool_calls
+    # Se houver tool calls em formato XML, retorna como parte do conteúdo
     if tool_calls:
-        return jsonify({
-            "id": f"chatcmpl-{agora}",
-            "object": "chat.completion",
-            "created": agora,
-            "model": model,
-            "choices": [
-                {
-                    "index": 0,
-                    "message": {"role": "assistant", "content": None, "tool_calls": tool_calls},
-                    "finish_reason": "tool_calls",
-                }
-            ],
-            "usage": {
-                "prompt_tokens": 0,
-                "completion_tokens": 0,
-                "total_tokens": 0,
-            },
-        })
+        # Tool calls já estão em formato XML estruturado
+        # O cliente pode identificar e processar as tags 
+        conteudo_com_tools = texto + '\n\n' + '\n\n'.join(tool_calls) if texto else '\n\n'.join(tool_calls)
+    else:
+        conteudo_com_tools = texto
     
-    # Caso contrário, retornar apenas o conteúdo de texto
     return jsonify({
         "id": f"chatcmpl-{agora}",
         "object": "chat.completion",
@@ -189,7 +175,7 @@ def chat_completions():
         "choices": [
             {
                 "index": 0,
-                "message": {"role": "assistant", "content": texto},
+                "message": {"role": "assistant", "content": conteudo_com_tools},
                 "finish_reason": "stop",
             }
         ],
