@@ -35,7 +35,138 @@ from selenium.webdriver.support import expected_conditions as EC
 from selenium.webdriver.support.ui import WebDriverWait
 
 import config
-import parser
+
+
+# ---------------------------------------------------------------------------
+# Parser próprio para detectar tool calls na resposta do DeepSeek
+# ---------------------------------------------------------------------------
+
+def _build_tool_call(name: str, args: str | dict, call_id_counter: list[int]) -> dict[str, Any]:
+    """Constrói um tool call no formato OpenAI."""
+    call_id = f"call_{call_id_counter[0]}"
+    call_id_counter[0] += 1
+    
+    if isinstance(args, str):
+        args_str = args
+    else:
+        args_str = json.dumps(args)
+    
+    return {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": name,
+            "arguments": args_str,
+        },
+    }
+
+
+def _extract_json_from_content(content: str) -> dict:
+    """Extrai JSON de um conteúdo, lidando com braces aninhados."""
+    start = content.find('{')
+    if start < 0:
+        return {}
+    
+    count = 0
+    end = start
+    for i, c in enumerate(content[start:], start):
+        if c == '{':
+            count += 1
+        elif c == '}':
+            count -= 1
+            if count == 0:
+                end = i + 1
+                break
+    
+    json_str = content[start:end]
+    try:
+        return json.loads(json_str)
+    except json.JSONDecodeError:
+        # Tenta corrigir escapes comuns (ex: \U em caminhos Windows)
+        try:
+            json_str_fixed = json_str.replace('\\', '\\\\')
+            return json.loads(json_str_fixed)
+        except json.JSONDecodeError:
+            return {"raw": content.strip()}
+
+
+def _parse_tool_calls_from_text(text: str) -> list[dict[str, Any]]:
+    """
+    Extrai tool calls de um texto de resposta do DeepSeek.
+    
+    Retorna uma lista de tool calls no formato OpenAI:
+    [
+      {
+        "id": "call_abc123",
+        "type": "function",
+        "function": {
+          "name": "nome_da_ferramenta",
+          "arguments": "{\"arg\": \"val\"}"
+        }
+      },
+      ...
+    ]
+    """
+    tool_calls = []
+    call_id_counter = [0]
+    
+    # 1. Tentar XML com atributo name: <tool_call name="x"> seguido de JSON ou conteudo
+    xml_attr_pattern = r'<tool_call\s+name=["\']([^"\']+)["\']\s*>([\s\S]*)'
+    for match in re.finditer(xml_attr_pattern, text, re.IGNORECASE):
+        name = match.group(1).strip()
+        content = match.group(2).strip()
+        
+        args = _extract_json_from_content(content)
+        if not args and content:
+            # Tenta extrair tags XML internas como <arg>val</arg>
+            arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
+            if arg_matches:
+                args = {k: v.strip() for k, v in arg_matches}
+            else:
+                args = {"raw": content}
+        
+        tool_calls.append(_build_tool_call(name, args, call_id_counter))
+    
+    # 2. Tentar XML com sub-tag <name>: <skill>...<name>x</name>...</skill>
+    xml_tag_pattern = r'<(\w+)>\s*<name>([^<]+)</name>(.*?)</\1>'
+    for match in re.finditer(xml_tag_pattern, text, re.DOTALL | re.IGNORECASE):
+        tag_name = match.group(1)
+        func_name = match.group(2).strip()
+        content = match.group(3).strip()
+        
+        args = _extract_json_from_content(content)
+        if not args:
+            param_matches = re.findall(r'<(\w+)>([^<]*)</\1>', content)
+            if param_matches:
+                args = {k: v.strip() for k, v in param_matches}
+            else:
+                args = {"raw": content}
+        
+        tool_calls.append(_build_tool_call(func_name, args, call_id_counter))
+    
+    # 3. Tentar JSON blocks: {"name": "x", "arguments": {...}}
+    json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'
+    for match in re.finditer(json_block_pattern, text, re.DOTALL):
+        name = match.group(1).strip()
+        args_str = match.group(2).strip()
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = {"raw": args_str}
+        tool_calls.append(_build_tool_call(name, args, call_id_counter))
+    
+    # 4. Tentar formato de texto: [Tool Call]: nome\n\nArguments: {...}
+    text_pattern = r'\[Tool Call\]:\s*([^\n]+)\s*\n\s*\n?\s*Arguments?:\s*(\{[^{}]*\})?'
+    for match in re.finditer(text_pattern, text, re.IGNORECASE):
+        name = match.group(1).strip()
+        args_str = match.group(2) if match.group(2) else "{}"
+        try:
+            args = json.loads(args_str)
+        except json.JSONDecodeError:
+            args = {"raw": args_str}
+        tool_calls.append(_build_tool_call(name, args, call_id_counter))
+    
+    return tool_calls
 
 
 # ---------------------------------------------------------------------------
@@ -515,7 +646,7 @@ def send_prompt(
         raise RuntimeError("Resposta do DeepSeek veio vazia.")
     
     texto_limpo = _limpar_resposta(texto)
-    tool_calls = parser.parse_tool_calls_from_text(texto_limpo)
+    tool_calls = _parse_tool_calls_from_text(texto_limpo)
     
     return texto_limpo, tool_calls
 
