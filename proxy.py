@@ -64,12 +64,17 @@ class ToolCallParser:
         self._call_id_counter += 1
         return f"call_{self._call_id_counter}"
     
-    def _extract_json_from_content(self, content: str) -> dict:
-        """Extrai JSON de um conteúdo, lidando com braces aninhados e strings."""
+    def _extract_json_from_content(self, content: str) -> tuple[dict, bool]:
+        """
+        Extrai JSON de um conteúdo, lidando com braces aninhados e strings.
+        
+        Returns:
+            Tupla (dict_args, is_valid_json) onde is_valid_json indica se o JSON foi parseado com sucesso
+        """
         # Tenta encontrar JSON começando pelo primeiro {
         start = content.find('{')
         if start < 0:
-            return {}
+            return {}, False
         
         count = 0
         in_string = False
@@ -104,15 +109,15 @@ class ToolCallParser:
         
         try:
             result = json.loads(json_str)
-            return result
+            return result, True
         except json.JSONDecodeError:
             # Tenta corrigir escapes comuns (ex: \ em caminhos Windows)
             try:
                 json_str_fixed = json_str.replace('\\', '\\\\')
                 result = json.loads(json_str_fixed)
-                return result
+                return result, True
             except json.JSONDecodeError:
-                return {"raw": content.strip()}
+                return {"raw": content.strip()}, False
     
     def _normalize_tool_call_to_xml(self, name: str, args: dict | str) -> str:
         """
@@ -123,7 +128,7 @@ class ToolCallParser:
             args: argumentos como dict ou string JSON
             
         Returns:
-            String formatada no estilo XML com CDATA para conteúdo
+            String formatada no estilo XML com CDATA para conteúdo, ou string vazia se JSON incompleto
         """
         if isinstance(args, str):
             try:
@@ -133,11 +138,20 @@ class ToolCallParser:
         else:
             args_dict = args
         
+        # Verifica se é um JSON incompleto/inválido (ex: {"todos": [ sem fechamento)
+        # Se tiver apenas uma chave "raw" e o valor parecer JSON incompleto, não formata como tool call válido
+        if len(args_dict) == 1 and "raw" in args_dict:
+            raw_value = args_dict["raw"]
+            # Verifica se parece ser JSON incompleto (começa com { mas não termina com })
+            if raw_value.strip().startswith('{') and not raw_value.strip().endswith('}'):
+                # JSON incompleto - retorna string vazia para indicar que não deve ser processado
+                return ""
+        
         # Constrói o XML com tags apropriadas
         xml_parts = [f'<tool_call name="{name}">']
         
         # Ordena as chaves para consistência, colocando filepath/content primeiro se existirem
-        priority_keys = ['filepath', 'path', 'file_path', 'content', 'code']
+        priority_keys = ['filepath', 'path', 'file_path', 'content', 'code', 'todos']
         other_keys = [k for k in args_dict.keys() if k not in priority_keys]
         sorted_keys = [k for k in priority_keys if k in args_dict] + other_keys
         
@@ -146,6 +160,9 @@ class ToolCallParser:
             if isinstance(value, str) and ('<' in value or '>' in value or len(value) > 100):
                 # Usa CDATA para conteúdo grande ou com caracteres especiais
                 xml_parts.append(f'<{key}><![CDATA[{value}]]></{key}>')
+            elif isinstance(value, list):
+                # Para listas (como todos), converte para JSON string dentro de CDATA
+                xml_parts.append(f'<{key}><![CDATA[{json.dumps(value)}]]></{key}>')
             else:
                 xml_parts.append(f'<{key}>{value}</{key}>')
         
@@ -196,11 +213,15 @@ class ToolCallParser:
                     if param_name not in args:
                         args[param_name.strip()] = param_value.strip()
                 
-                if args:
-                    xml_formatted = self._normalize_tool_call_to_xml(tool_name, args)
-                    tool_calls_xml.insert(0, xml_formatted)  # Insere no início para manter ordem
-                    # Remove o bloco tool_call do texto
-                    cleaned_text = cleaned_text.replace(match.group(0), '')
+                # Se encontrou pelo menos um parâmetro válido (não vazio), processa o tool call
+                # Tags CDATA vazias ou incompletas indicam stream cortado - ignora
+                valid_params = {k: v for k, v in args.items() if v}  # Filtra valores vazios
+                if valid_params:
+                    xml_formatted = self._normalize_tool_call_to_xml(tool_name, valid_params)
+                    if xml_formatted:  # Só adiciona se não for string vazia
+                        tool_calls_xml.insert(0, xml_formatted)
+                        # Remove o bloco tool_call do texto
+                        cleaned_text = cleaned_text.replace(match.group(0), '')
         
         # Se não encontrou no formato XML com params, tenta o formato mais simples
         if not tool_calls_xml:
@@ -215,17 +236,18 @@ class ToolCallParser:
                     content_start = content_from_tool.find('>') + 1
                     content = content_from_tool[content_start:].strip()
                     
-                    args = self._extract_json_from_content(content)
-                    if not args and content:
+                    args, is_valid_json = self._extract_json_from_content(content)
+                    # Se o JSON foi extraído com sucesso (mesmo que seja {"raw": ...}), usa os args
+                    # Só tenta extrair tags XML se não houver JSON válido
+                    if not is_valid_json and content:
                         arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
                         if arg_matches:
                             args = {k: v.strip() for k, v in arg_matches}
-                        else:
-                            args = {"raw": content}
                     
-                    xml_formatted = self._normalize_tool_call_to_xml(name, args)
-                    tool_calls_xml.append(xml_formatted)
-                    cleaned_text = cleaned_text[:first_tool]
+                    if args:
+                        xml_formatted = self._normalize_tool_call_to_xml(name, args)
+                        tool_calls_xml.append(xml_formatted)
+                        cleaned_text = cleaned_text[:first_tool]
         
         # Padrão 2: Formato JSON {\"name\": \"x\", \"arguments\": {...}}
         json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'
@@ -254,8 +276,12 @@ class ToolCallParser:
                 args = {"raw": args_str}
             
             xml_formatted = self._normalize_tool_call_to_xml(name, args)
-            tool_calls_xml.append(xml_formatted)
+            if xml_formatted:  # Só adiciona se não for string vazia (JSON incompleto)
+                tool_calls_xml.append(xml_formatted)
             cleaned_text = cleaned_text.replace(full_match, '')
+        
+        # Filtra strings vazias da lista final
+        tool_calls_xml = [t for t in tool_calls_xml if t.strip()]
         
         return cleaned_text.strip(), tool_calls_xml
 
@@ -620,13 +646,17 @@ def stream_prompt(
     messages: list,
     timeout: int = config.DEFAULT_TIMEOUT,
     account: str | None = None,
-) -> Iterator[str]:
+) -> Iterator[dict]:
     """
-    Envia mensagens (formato OpenAI) ao DeepSeek e yield deltas de texto em tempo real.
-
-    Cada yield é um fragmento (string) novo que apareceu na resposta.
-    O generator termina quando o DeepSeek acaba de gerar.
-
+    Envia mensagens (formato OpenAI) ao DeepSeek e yield deltas processados em tempo real.
+    
+    Usa um buffer interno para acumular texto e detectar tool calls antes de enviar ao cliente.
+    Isso garante que tool calls sejam formatadas corretamente em XML e não vazem como texto normal.
+    
+    Cada yield é um dicionário com:
+        - 'type': 'text' ou 'tool_call'
+        - 'content': o conteúdo (texto limpo ou tool call XML formatada)
+    
     Parâmetros:
         messages: histórico no formato OpenAI.
         timeout: timeout máximo em segundos.
@@ -677,6 +707,11 @@ def stream_prompt(
         ultimo_poll = time.time()
         stable_done_count = 0
         STABLE_POLLS_NEEDED = 4  # ~800ms de estabilidade sem deltas pra considerar concluído
+        
+        # Buffer para acumular texto e detectar tool calls antes de enviar
+        text_buffer = ""
+        last_processed_length = 0
+        pending_tool_start = False  # Flag para detectar se estamos no meio de uma potential tool call
 
         try:
             while time.time() < deadline:
@@ -688,8 +723,56 @@ def stream_prompt(
                     primeira_resposta_vista = True
                     sem_deltas_ha = 0.0
                     stable_done_count = 0  # reset se chegar delta novo
+                    
+                    # Acumula deltas no buffer
                     for delta in deltas:
-                        yield delta
+                        text_buffer += delta
+                    
+                    # Processa o buffer para extrair texto limpo e tool calls
+                    # Só processa se tiver conteúdo suficiente ou se estiver finalizado
+                    should_process = done or len(text_buffer) > 200 or '\n' in text_buffer
+                    
+                    if should_process:
+                        # Verifica se não estamos no meio de uma tag de tool call incompleta
+                        # Se o buffer terminar com "<tool_call" ou similar, espera mais dados
+                        incomplete_tool_patterns = [
+                            r'<tool_call\s*$',
+                            r'<tool_call\s+name\s*$',
+                            r'<tool_call\s+name="[^"]*$',
+                            r'<tool_call\s+name=\'[^\']*$',
+                        ]
+                        
+                        is_incomplete = False
+                        for pattern in incomplete_tool_patterns:
+                            if re.search(pattern, text_buffer, re.IGNORECASE):
+                                is_incomplete = True
+                                break
+                        
+                        if not is_incomplete or done:
+                            # Tenta parsear o buffer
+                            cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
+                            
+                            # Envia apenas o texto já processado (até last_processed_length)
+                            new_text = cleaned_text[last_processed_length:]
+                            if new_text.strip():
+                                yield {'type': 'text', 'content': new_text}
+                            
+                            # Envia tool calls encontradas
+                            for tool_call_xml in tool_calls:
+                                yield {'type': 'tool_call', 'content': tool_call_xml}
+                            
+                            # Atualiza o último comprimento processado
+                            last_processed_length = len(cleaned_text)
+                            
+                            # Mantém no buffer apenas o que ainda não foi totalmente processado
+                            # (caso haja tool calls incompletas no final)
+                            if not done:
+                                # Encontra a última posição segura para cortar
+                                # Corta após o último caractere processado do texto original
+                                safe_cut_pos = len(text_buffer) - len(delta) - 50 if len(delta) > 50 else 0
+                                if safe_cut_pos > 0 and safe_cut_pos < len(text_buffer):
+                                    text_buffer = text_buffer[safe_cut_pos:]
+                                    last_processed_length = max(0, last_processed_length - safe_cut_pos)
                 else:
                     sem_deltas_ha += (time.time() - ultimo_poll)
                     if done:
@@ -712,7 +795,16 @@ def stream_prompt(
                     time.sleep(0.3)
                     info_final = _poll_deltas(driver)
                     for delta in (info_final.get("deltas", []) or []):
-                        yield delta
+                        text_buffer += delta
+                    
+                    # Processamento final do buffer restante
+                    cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
+                    new_text = cleaned_text[last_processed_length:]
+                    if new_text.strip():
+                        yield {'type': 'text', 'content': new_text}
+                    for tool_call_xml in tool_calls:
+                        yield {'type': 'tool_call', 'content': tool_call_xml}
+                    
                     return
 
                 time.sleep(0.2)
@@ -720,7 +812,15 @@ def stream_prompt(
             # Timeout total atingido: faz flush do que tiver
             info_final = _poll_deltas(driver)
             for delta in (info_final.get("deltas", []) or []):
-                yield delta
+                text_buffer += delta
+            
+            # Processamento final do buffer restante
+            cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
+            new_text = cleaned_text[last_processed_length:]
+            if new_text.strip():
+                yield {'type': 'text', 'content': new_text}
+            for tool_call_xml in tool_calls:
+                yield {'type': 'tool_call', 'content': tool_call_xml}
 
         finally:
             _stop_observer(driver)
@@ -742,17 +842,32 @@ def send_prompt(
     <content><![CDATA[...]]></content>
     
     """
-    partes = []
-    for delta in stream_prompt(messages, timeout=timeout, account=account):
-        partes.append(delta)
-    texto = "".join(partes)
-    if not texto:
+    texto_completo = ""
+    tool_calls_xml = []
+    
+    for item in stream_prompt(messages, timeout=timeout, account=account):
+        if isinstance(item, dict):
+            item_type = item.get('type', 'text')
+            content = item.get('content', '')
+            
+            if item_type == 'text':
+                texto_completo += content
+            elif item_type == 'tool_call':
+                tool_calls_xml.append(content)
+        else:
+            # Fallback para formato antigo (string) - compatibilidade
+            texto_completo += str(item)
+    
+    if not texto_completo and not tool_calls_xml:
         raise RuntimeError("Resposta do DeepSeek veio vazia.")
     
-    texto_limpo = _limpar_resposta(texto)
-    texto_sem_tools, tool_calls_xml = tool_parser.parse_and_format_tools(texto_limpo)
+    # Processa o texto completo para extrair qualquer tool call remanescente
+    texto_sem_tools, remaining_tool_calls = tool_parser.parse_and_format_tools(texto_completo)
     
-    return texto_sem_tools, tool_calls_xml
+    # Combina tool calls detectadas durante o stream com as do processamento final
+    all_tool_calls = tool_calls_xml + [t for t in remaining_tool_calls if t not in tool_calls_xml]
+    
+    return texto_sem_tools, all_tool_calls
 
 
 def send_prompt_with_tools(
