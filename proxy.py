@@ -65,14 +65,33 @@ class ToolCallParser:
         return f"call_{self._call_id_counter}"
     
     def _extract_json_from_content(self, content: str) -> dict:
-        """Extrai JSON de um conteúdo, lidando com braces aninhados."""
+        """Extrai JSON de um conteúdo, lidando com braces aninhados e strings."""
+        # Tenta encontrar JSON começando pelo primeiro {
         start = content.find('{')
         if start < 0:
             return {}
         
         count = 0
-        end = start
+        in_string = False
+        escape_next = False
+        end = len(content)  # Default para o fim se não encontrar fechamento
+        
         for i, c in enumerate(content[start:], start):
+            if escape_next:
+                escape_next = False
+                continue
+            
+            if c == '\\':
+                escape_next = True
+                continue
+            
+            if c == '"' and not escape_next:
+                in_string = not in_string
+                continue
+            
+            if in_string:
+                continue
+            
             if c == '{':
                 count += 1
             elif c == '}':
@@ -82,13 +101,16 @@ class ToolCallParser:
                     break
         
         json_str = content[start:end]
+        
         try:
-            return json.loads(json_str)
+            result = json.loads(json_str)
+            return result
         except json.JSONDecodeError:
-            # Tenta corrigir escapes comuns (ex: \U em caminhos Windows)
+            # Tenta corrigir escapes comuns (ex: \ em caminhos Windows)
             try:
-                json_str_fixed = json_str.replace('\\\\', '\\\\\\\\')
-                return json.loads(json_str_fixed)
+                json_str_fixed = json_str.replace('\\', '\\\\')
+                result = json.loads(json_str_fixed)
+                return result
             except json.JSONDecodeError:
                 return {"raw": content.strip()}
     
@@ -145,25 +167,38 @@ class ToolCallParser:
         cleaned_text = text
         
         # Padrão 1: <tool_call name="x"> seguido de JSON ou tags XML
-        xml_attr_pattern = r'<tool_call\s+name=["\']([^"\']+)["\']\s*>([\s\S]*?)(?:|$)'
-        for match in re.finditer(xml_attr_pattern, cleaned_text, re.IGNORECASE):
-            full_match = match.group(0)
-            name = match.group(1).strip()
-            content = match.group(2).strip()
+        # Pattern melhorado para capturar até o fim do conteúdo (JSON ou XML)
+        # Primeiro verifica se existe pelo menos um tool_call
+        if '<tool_call' not in cleaned_text.lower():
+            pass  # Pula para os próximos padrões
+        else:
+            # Encontra a posição do primeiro <tool_call
+            first_tool = cleaned_text.lower().find('<tool_call')
+            # Pega todo o conteúdo desde o primeiro tool_call até o fim
+            content_from_tool = cleaned_text[first_tool:]
             
-            args = self._extract_json_from_content(content)
-            if not args and content:
-                arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
-                if arg_matches:
-                    args = {k: v.strip() for k, v in arg_matches}
-                else:
-                    args = {"raw": content}
-            
-            xml_formatted = self._normalize_tool_call_to_xml(name, args)
-            tool_calls_xml.append(xml_formatted)
-            cleaned_text = cleaned_text.replace(full_match, '')
+            # Extrai o nome da ferramenta
+            name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', content_from_tool, re.IGNORECASE)
+            if name_match:
+                name = name_match.group(1).strip()
+                # O conteúdo é tudo depois da tag de abertura
+                content_start = content_from_tool.find('>') + 1
+                content = content_from_tool[content_start:].strip()
+                
+                args = self._extract_json_from_content(content)
+                if not args and content:
+                    arg_matches = re.findall(r'<(\w+)>([^<]*)</\w+>', content)
+                    if arg_matches:
+                        args = {k: v.strip() for k, v in arg_matches}
+                    else:
+                        args = {"raw": content}
+                
+                xml_formatted = self._normalize_tool_call_to_xml(name, args)
+                tool_calls_xml.append(xml_formatted)
+                # Remove todo o conteúdo desde o primeiro tool_call
+                cleaned_text = cleaned_text[:first_tool]
         
-        # Padrão 2: Formato JSON {"name": "x", "arguments": {...}}
+        # Padrão 2: Formato JSON {\"name\": \"x\", \"arguments\": {...}}
         json_block_pattern = r'\{\s*"name"\s*:\s*"([^"]+)"\s*,\s*"arguments"\s*:\s*(\{[^{}]*\})\s*\}'
         for match in re.finditer(json_block_pattern, cleaned_text, re.DOTALL):
             full_match = match.group(0)
@@ -512,7 +547,8 @@ def _extract_last_user_prompt(messages: list) -> str:
 
     users = [m for m in messages if m.get("role") == "user"]
     if len(messages) == 1 and len(users) == 1:
-        return _clean.sub("", str(users[0].get("content", "")))
+        content = _clean.sub("", str(users[0].get("content", "")))
+        return f"{content}\n\nPlease respond using XML-formatted tool calls when needed, following this structure:\n<tool_call name=\"tool_name\">\n<parameter_name>value</parameter_name>\n<another_parameter><![CDATA[content]]></another_parameter>\n"
 
     linhas = []
     primeiro_user = False
@@ -541,7 +577,10 @@ def _extract_last_user_prompt(messages: list) -> str:
                 continue
             tool_name = m.get("name") or "tool"
             linhas.append(f"[Tool Result ({tool_name})]\n{content}\n")
-    return "\n".join(linhas).strip()
+    
+    result = "\n".join(linhas).strip()
+    result += "\n\nPlease respond using XML-formatted tool calls when needed, following this structure:\n<tool_call name=\"tool_name\">\n<parameter_name>value</parameter_name>\n<another_parameter><![CDATA[content]]></another_parameter>\n"
+    return result
 
 
 # ---------------------------------------------------------------------------
