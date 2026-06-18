@@ -324,6 +324,173 @@ class ToolCallParser:
 tool_parser = ToolCallParser()
 
 
+def _safe_text_flush_length(buffer: str) -> int:
+    """Avoid flushing a trailing prefix that may become ``<tool_call``."""
+    marker = "<tool_call"
+    lower = buffer.lower()
+    max_suffix = min(len(marker) - 1, len(buffer))
+    for size in range(max_suffix, 0, -1):
+        if marker.startswith(lower[-size:]):
+            return len(buffer) - size
+    return len(buffer)
+
+
+def _extract_xml_params_with_spans(content: str) -> dict[str, tuple[str, int]]:
+    """Return complete XML params and their end offsets inside ``content``."""
+    params: dict[str, tuple[str, int]] = {}
+    cdata_spans: list[tuple[int, int]] = []
+
+    cdata_pattern = re.compile(r'<(\w+)>\s*<!\[CDATA\[(.*?)\]\]>\s*</\1>', re.DOTALL | re.IGNORECASE)
+    for match in cdata_pattern.finditer(content):
+        params[match.group(1).strip()] = (match.group(2), match.end())
+        cdata_spans.append(match.span())
+
+    simple_pattern = re.compile(r'<(\w+)>([^<]*)</\1>', re.DOTALL | re.IGNORECASE)
+    for match in simple_pattern.finditer(content):
+        if any(start <= match.start() < end for start, end in cdata_spans):
+            continue
+        key = match.group(1).strip()
+        if key not in params:
+            params[key] = (match.group(2).strip(), match.end())
+
+    return params
+
+
+def _extract_parameter_name_params(content: str) -> tuple[dict[str, str], int] | None:
+    """
+    Parse model output shaped as parameter_name tags plus a raw value.
+
+    Some models emit:
+        <parameter_name>filePath</parameter_name>
+        <parameter_name>value</parameter_name>C:\path\file.json
+    instead of:
+        <filePath>C:\path\file.json</filePath>
+    """
+    closing_match = re.search(r'</tool_call\s*>', content, re.IGNORECASE)
+    if not closing_match:
+        return None
+
+    body = content[:closing_match.start()]
+    tag_pattern = re.compile(r'<parameter_name>(.*?)</parameter_name>', re.DOTALL | re.IGNORECASE)
+    tags = list(tag_pattern.finditer(body))
+    if not tags:
+        return None
+
+    args: dict[str, str] = {}
+    consumed_until = closing_match.end()
+
+    if len(tags) >= 2 and tags[1].group(1).strip().lower() == "value":
+        key = tags[0].group(1).strip()
+        value = body[tags[1].end():].strip()
+        if key and value:
+            args[key] = value
+    elif len(tags) == 1:
+        key = tags[0].group(1).strip()
+        value = body[tags[0].end():].strip()
+        if key and value:
+            args[key] = value
+    else:
+        for index in range(0, len(tags) - 1, 2):
+            key = tags[index].group(1).strip()
+            value = tags[index + 1].group(1).strip()
+            if key and value:
+                args[key] = value
+
+    if not args:
+        return None
+    return args, consumed_until
+
+
+def _try_extract_complete_xml_tool_call(buffer: str) -> tuple[str, int] | None:
+    """Parse one complete XML tool call from the start of ``buffer``."""
+    open_match = re.match(r'<tool_call\s+name=["\']([^"\']+)["\']\s*>', buffer, re.IGNORECASE)
+    if not open_match:
+        return None
+
+    tool_name = open_match.group(1).strip()
+    content = buffer[open_match.end():]
+
+    parameter_name_params = _extract_parameter_name_params(content)
+    if parameter_name_params:
+        valid_params, relative_end = parameter_name_params
+        xml = tool_parser._normalize_tool_call_to_xml(tool_name, valid_params)
+        if not xml:
+            return None
+        return xml, open_match.end() + relative_end
+
+    params_with_spans = _extract_xml_params_with_spans(content)
+    valid_params = {
+        key: value
+        for key, (value, _end) in params_with_spans.items()
+        if value is not None and str(value).strip()
+    }
+
+    if tool_name == "write_file":
+        path_key = next((key for key in ("file_path", "filepath", "path") if key in valid_params), None)
+        if not path_key or "content" not in valid_params:
+            return None
+        required_keys = [path_key, "content"]
+    elif tool_name == "todo_write":
+        if "todos" not in valid_params:
+            return None
+        try:
+            todos = json.loads(valid_params["todos"])
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(todos, list):
+            return None
+        required_keys = ["todos"]
+    else:
+        if not valid_params or set(valid_params) == {"parameter_name"}:
+            return None
+        required_keys = list(valid_params)
+
+    end = open_match.end() + max(params_with_spans[key][1] for key in required_keys)
+    closing_match = re.match(r'\s*</tool_call\s*>', buffer[end:], re.IGNORECASE)
+    if closing_match:
+        end += closing_match.end()
+
+    xml = tool_parser._normalize_tool_call_to_xml(tool_name, valid_params)
+    if not xml:
+        return None
+    return xml, end
+
+
+def _drain_tool_stream_buffer(buffer: str, final: bool = False) -> tuple[list[dict[str, str]], str]:
+    """
+    Convert buffered text into stream events without leaking partial tool XML.
+
+    Once a ``<tool_call`` marker appears, everything from that marker stays in
+    the buffer until a complete call can be emitted as a single structured event.
+    """
+    events: list[dict[str, str]] = []
+
+    while buffer:
+        tool_start = buffer.lower().find("<tool_call")
+        if tool_start < 0:
+            flush_len = len(buffer) if final else _safe_text_flush_length(buffer)
+            if flush_len <= 0:
+                break
+            events.append({"type": "text", "content": buffer[:flush_len]})
+            buffer = buffer[flush_len:]
+            continue
+
+        if tool_start > 0:
+            events.append({"type": "text", "content": buffer[:tool_start]})
+            buffer = buffer[tool_start:]
+            continue
+
+        extracted = _try_extract_complete_xml_tool_call(buffer)
+        if not extracted:
+            break
+
+        xml, end = extracted
+        events.append({"type": "tool_call", "content": xml})
+        buffer = buffer[end:]
+
+    return events, buffer
+
+
 # ---------------------------------------------------------------------------
 # Account Pool — gerencia múltiplos drivers (um por conta/projeto)
 # ---------------------------------------------------------------------------
@@ -744,8 +911,6 @@ def stream_prompt(
         
         # Buffer para acumular texto e detectar tool calls antes de enviar
         text_buffer = ""
-        last_processed_length = 0
-        pending_tool_start = False  # Flag para detectar se estamos no meio de uma potential tool call
 
         try:
             while time.time() < deadline:
@@ -761,104 +926,11 @@ def stream_prompt(
                     # Acumula deltas no buffer
                     for delta in deltas:
                         text_buffer += delta
-                    
-                    # Processa o buffer para extrair texto limpo e tool calls
-                    # Só processa se tiver conteúdo suficiente ou se estiver finalizado
-                    should_process = done or len(text_buffer) > 200 or '\n' in text_buffer
-                    
-                    if should_process or done:
-                        # Verifica se não estamos no meio de uma tag de tool call incompleta
-                        # Se o buffer terminar com "<tool_call" ou similar, espera mais dados
-                        incomplete_tool_patterns = [
-                            r'<tool_call\s*$',
-                            r'<tool_call\s+name\s*$',
-                            r'<tool_call\s+name="[^"]*$',
-                            r'<tool_call\s+name=\'[^\']*$',
-                            r'<!\[CDATA\[(?:(?!\]\]>).)*$',  # CDATA incompleto
-                            r'<filepath>[^<]*$',  # filepath incompleto
-                            r'<content>[^<]*$',   # content tag aberta sem conteúdo
-                            r'</content>$',       # fechamento de content sem CDATA completo
-                        ]
-                        
-                        is_incomplete = False
-                        for pattern in incomplete_tool_patterns:
-                            if re.search(pattern, text_buffer, re.IGNORECASE):
-                                is_incomplete = True
-                                break
-                        
-                        # Só processa se NÃO estiver incompleto OU se estiver finalizado
-                        if not is_incomplete or done:
-                            # Tenta parsear o buffer
-                            cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
-                            
-                            # FILTRA tool calls incompletas - só envia se tiver todos os parâmetros obrigatórios
-                            valid_tool_calls = []
-                            invalid_tool_calls = []  # Mantém tool calls incompletas no buffer
-                            
-                            for tool_call_xml in tool_calls:
-                                # Verifica se é uma tool call completa
-                                is_complete = False
-                                
-                                if 'write_file' in tool_call_xml:
-                                    # write_file precisa de filepath E content com CDATA completo
-                                    has_path = any(tag in tool_call_xml for tag in ['<filepath>', '<file_path>', '<path>'])
-                                    has_content_start = '<content>' in tool_call_xml and '<![CDATA[' in tool_call_xml
-                                    has_content_end = ']]>' in tool_call_xml and '</content>' in tool_call_xml
-                                    is_complete = has_path and has_content_start and has_content_end
-                                    
-                                elif 'todo_write' in tool_call_xml:
-                                    # todo_write precisa de <todos> com array JSON completo
-                                    has_todos = '<todos>' in tool_call_xml and '</todos>' in tool_call_xml
-                                    # Verifica se o conteúdo de todos é um array JSON válido e completo
-                                    if has_todos:
-                                        todos_match = re.search(r'<todos><!\[CDATA\[(.*?)\]\]></todos>', tool_call_xml, re.DOTALL)
-                                        if todos_match:
-                                            try:
-                                                todos_data = json.loads(todos_match.group(1))
-                                                is_complete = isinstance(todos_data, list) and len(todos_data) > 0
-                                            except json.JSONDecodeError:
-                                                is_complete = False
-                                else:
-                                    # Para outras tools, considera válida se tiver pelo menos um parâmetro
-                                    is_complete = bool(re.search(r'<\w+>.+?</\w+>', tool_call_xml, re.DOTALL))
-                                
-                                if is_complete:
-                                    valid_tool_calls.append(tool_call_xml)
-                                else:
-                                    invalid_tool_calls.append(tool_call_xml)
-                            
-                            # Envia apenas o texto já processado (até last_processed_length)
-                            new_text = cleaned_text[last_processed_length:]
-                            if new_text.strip():
-                                yield {'type': 'text', 'content': new_text}
-                            
-                            # Envia APENAS tool calls válidas e completas
-                            for tool_call_xml in valid_tool_calls:
-                                yield {'type': 'tool_call', 'content': tool_call_xml}
-                            
-                            # Atualiza o último comprimento processado
-                            last_processed_length = len(cleaned_text)
-                            
-                            # Se houver tool calls inválidas/incompletas, mantém no buffer
-                            # Remove do buffer apenas o que já foi enviado como texto limpo
-                            if invalid_tool_calls and not done:
-                                # Encontra a posição da primeira tool call incompleta no buffer original
-                                # e mantém tudo a partir dali no buffer
-                                first_invalid_pos = len(text_buffer)
-                                for invalid_tc in invalid_tool_calls:
-                                    pos = text_buffer.find(invalid_tc.split('name=')[0].split('<tool_call')[0] if '<tool_call' in invalid_tc else 0)
-                                    if pos >= 0 and pos < first_invalid_pos:
-                                        first_invalid_pos = pos
-                                
-                                if first_invalid_pos < len(text_buffer):
-                                    text_buffer = text_buffer[first_invalid_pos:]
-                                    last_processed_length = max(0, last_processed_length - first_invalid_pos)
-                            elif not done:
-                                # Buffer processing normal para texto sem tool calls incompletas
-                                safe_cut_pos = len(text_buffer) - len(delta) - 50 if len(delta) > 50 else 0
-                                if safe_cut_pos > 0 and safe_cut_pos < len(text_buffer):
-                                    text_buffer = text_buffer[safe_cut_pos:]
-                                    last_processed_length = max(0, last_processed_length - safe_cut_pos)
+
+                    events, text_buffer = _drain_tool_stream_buffer(text_buffer, final=done)
+                    for event in events:
+                        if event["content"]:
+                            yield event
                 else:
                     sem_deltas_ha += (time.time() - ultimo_poll)
                     if done:
@@ -884,12 +956,10 @@ def stream_prompt(
                         text_buffer += delta
                     
                     # Processamento final do buffer restante
-                    cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
-                    new_text = cleaned_text[last_processed_length:]
-                    if new_text.strip():
-                        yield {'type': 'text', 'content': new_text}
-                    for tool_call_xml in tool_calls:
-                        yield {'type': 'tool_call', 'content': tool_call_xml}
+                    events, text_buffer = _drain_tool_stream_buffer(text_buffer, final=True)
+                    for event in events:
+                        if event["content"]:
+                            yield event
                     
                     return
 
@@ -901,12 +971,10 @@ def stream_prompt(
                 text_buffer += delta
             
             # Processamento final do buffer restante
-            cleaned_text, tool_calls = tool_parser.parse_and_format_tools(text_buffer)
-            new_text = cleaned_text[last_processed_length:]
-            if new_text.strip():
-                yield {'type': 'text', 'content': new_text}
-            for tool_call_xml in tool_calls:
-                yield {'type': 'tool_call', 'content': tool_call_xml}
+            events, text_buffer = _drain_tool_stream_buffer(text_buffer, final=True)
+            for event in events:
+                if event["content"]:
+                    yield event
 
         finally:
             _stop_observer(driver)

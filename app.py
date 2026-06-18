@@ -31,6 +31,31 @@ import tools
 app = Flask(__name__)
 
 
+def _xml_tool_call_to_openai(xml_call: str, call_id: str, index: int | None = None) -> dict | None:
+    name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']\s*>', xml_call, re.IGNORECASE)
+    if not name_match:
+        return None
+
+    tool_name = name_match.group(1)
+    content = xml_call[name_match.end():]
+    args = {
+        param_name: param_value
+        for param_name, (param_value, _end) in proxy._extract_xml_params_with_spans(content).items()
+    }
+
+    tool_call = {
+        "id": call_id,
+        "type": "function",
+        "function": {
+            "name": tool_name,
+            "arguments": json.dumps(args),
+        },
+    }
+    if index is not None:
+        tool_call["index"] = index
+    return tool_call
+
+
 # ---------------------------------------------------------------------------
 # Rotas
 # ---------------------------------------------------------------------------
@@ -120,13 +145,6 @@ def chat_completions():
                 "choices": [{"index": 0, **kw}],
             }) + "\n\n"
 
-        def _extract_clean_text(text: str) -> str:
-            """Extrai apenas o texto limpo, removendo tool calls."""
-            if not text:
-                return ""
-            clean, _ = proxy.tool_parser.parse_and_format_tools(text)
-            return clean
-
         def gerar():
             yield _chunk(delta={"role": "assistant"}, finish_reason=None)
 
@@ -141,36 +159,20 @@ def chat_completions():
                         content = item.get('content', '')
                         
                         if item_type == 'tool_call':
-                            # Processa tool call XML e converte para formato OpenAI
-                            name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', content)
-                            if name_match:
-                                tool_name = name_match.group(1)
-                                args = {}
-                                param_matches = re.findall(r'<(\w+)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\w+>', content, re.DOTALL)
-                                for param_name, param_value in param_matches:
-                                    if param_name != 'tool_call':
-                                        args[param_name.strip()] = param_value.strip()
-                                
-                                # Envia tool call no formato OpenAI
-                                tool_index = len(tool_calls_detected)
+                            tool_index = len(tool_calls_detected)
+                            openai_tool_call = _xml_tool_call_to_openai(
+                                content,
+                                call_id=f"call_{tool_index + 1}",
+                                index=tool_index,
+                            )
+                            if openai_tool_call:
                                 yield _chunk(
-                                    delta={
-                                        "tool_calls": [{
-                                            "index": tool_index,
-                                            "id": f"call_{tool_index + 1}",
-                                            "type": "function",
-                                            "function": {
-                                                "name": tool_name,
-                                                "arguments": json.dumps(args)
-                                            }
-                                        }]
-                                    },
+                                    delta={"tool_calls": [openai_tool_call]},
                                     finish_reason=None
                                 )
                                 tool_calls_detected.append(content)
                         elif item_type == 'text' and content:
                             # Acumula texto e envia delta
-                            previous_len = len(accumulated_text)
                             accumulated_text += content
                             yield _chunk(delta={"content": content}, finish_reason=None)
                     else:
@@ -181,28 +183,15 @@ def chat_completions():
                             
                             if tool_calls_xml:
                                 for idx, xml_call in enumerate(tool_calls_xml):
-                                    name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', xml_call)
-                                    if name_match:
-                                        tool_name = name_match.group(1)
-                                        args = {}
-                                        param_matches = re.findall(r'<(\w+)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\w+>', xml_call, re.DOTALL)
-                                        for param_name, param_value in param_matches:
-                                            if param_name != 'tool_call':
-                                                args[param_name.strip()] = param_value.strip()
-                                        
-                                        tool_index = len(tool_calls_detected)
+                                    tool_index = len(tool_calls_detected)
+                                    openai_tool_call = _xml_tool_call_to_openai(
+                                        xml_call,
+                                        call_id=f"call_{tool_index + 1}",
+                                        index=tool_index,
+                                    )
+                                    if openai_tool_call:
                                         yield _chunk(
-                                            delta={
-                                                "tool_calls": [{
-                                                    "index": tool_index,
-                                                    "id": f"call_{tool_index + 1}",
-                                                    "type": "function",
-                                                    "function": {
-                                                        "name": tool_name,
-                                                        "arguments": json.dumps(args)
-                                                    }
-                                                }]
-                                            },
+                                            delta={"tool_calls": [openai_tool_call]},
                                             finish_reason=None
                                         )
                                         tool_calls_detected.append(xml_call)
@@ -252,25 +241,9 @@ def chat_completions():
     if tool_calls:
         openai_tool_calls = []
         for idx, xml_call in enumerate(tool_calls):
-            # Extrai nome e argumentos do XML
-            name_match = re.search(r'<tool_call\s+name=["\']([^"\']+)["\']', xml_call)
-            if name_match:
-                tool_name = name_match.group(1)
-                # Extrai todos os parâmetros do XML
-                args = {}
-                param_matches = re.findall(r'<(\w+)>(?:<!\[CDATA\[)?(.*?)(?:\]\]>)?</\w+>', xml_call, re.DOTALL)
-                for param_name, param_value in param_matches:
-                    if param_name != 'tool_call':  # Ignora a tag principal
-                        args[param_name.strip()] = param_value.strip()
-                
-                openai_tool_calls.append({
-                    "id": f"call_{idx + 1}",
-                    "type": "function",
-                    "function": {
-                        "name": tool_name,
-                        "arguments": json.dumps(args)
-                    }
-                })
+            openai_tool_call = _xml_tool_call_to_openai(xml_call, call_id=f"call_{idx + 1}")
+            if openai_tool_call:
+                openai_tool_calls.append(openai_tool_call)
         
         if openai_tool_calls:
             message_data["tool_calls"] = openai_tool_calls
